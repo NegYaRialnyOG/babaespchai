@@ -7,6 +7,9 @@
 		<key>Bundles</key>
 		<array>
 			<string>com.skullcapstudios.bps</string>
+			<string>com.skullcapstudios.blockpost</string>
+			<string>com.skullcapstudios.blockpostmobile</string>
+			<string>com.skullcapstudios.blockpostmobileios</string>
 		</array>
 	</dict>
 </dict>

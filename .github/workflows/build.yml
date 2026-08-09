@@ -4,19 +4,20 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Setup Theos & SDKs
         run: |
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          git clone https://github.com/theos/sdks.git $HOME/theos/sdks
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
       - name: Build Tweak
         run: |
-          $HOME/theos/bin/make package FINALPACKAGE=1
+          make package FINALPACKAGE=1 THEOS=$HOME/theos
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

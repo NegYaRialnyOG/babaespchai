@@ -1,0 +1,9 @@
+Package: com.neqyarialnyog.babaespchai
+Name: Blockpost 2D Box ESP
+Depends: mobilesubstrate
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: 2D Box ESP for Blockpost Mobile
+Maintainer: NeqYaRialnyOG & Nyx
+Author: NeqYaRialnyOG & Nyx
+Section: Tweaks

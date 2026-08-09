@@ -1,0 +1,17 @@
+name: Build iOS Tweak
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: theos/theos-action@v1
+      - run: make package FINALPACKAGE=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compiled-tweak
+          path: |
+            packages/*.deb
+            .theos/obj/*.dylib
+            .theos/obj/debug/*.dylib

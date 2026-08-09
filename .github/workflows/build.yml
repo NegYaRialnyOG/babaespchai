@@ -9,10 +9,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select Xcode
+      - name: Select Xcode & Install ldid
         run: |
           sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          xcrun --sdk iphoneos --show-sdk-path || true
+          brew install ldid || true
 
       - name: Setup Theos & SDKs
         run: |

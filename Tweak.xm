@@ -1,10 +1,11 @@
+#import <UIKit/UIKit.h>
 #include <substrate.h>
 #include <mach-o/dyld.h>
 #include <CoreGraphics/CoreGraphics.h>
 
 struct Vector3 { float x, y, z; };
 struct Vector2 { float x, y; };
-struct Rect { float x, y, width, height; };
+struct UnityRect { float x, y, width, height; };
 
 typedef Vector2 (*WorldToScreenPoint_t)(void* camera, Vector3 worldPoint);
 typedef void* (*Camera_get_main_t)();

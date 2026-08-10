@@ -18,6 +18,8 @@
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <mach-o/dyld.h>
+#include <string.h>
 #include <string>
 #include <cctype>
 
@@ -78,7 +80,7 @@ static void loader_log(NSString* fmt, ...) {
         }
         g_statusLabel.text = [@"[ESPLoader] " stringByAppendingString:line];
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             g_statusWindow.hidden = YES;
         });
     });
@@ -87,7 +89,7 @@ static void loader_log(NSString* fmt, ...) {
 // ---------------------------------------------------------------------------
 // Minimal synchronous HTTP helpers (semaphore-gated NSURLSession — this all
 // runs on a background queue from %ctor, never the main thread).
-static NSData* http_get_data(NSString* urlStr, NSString* accept, NSTimeInterval timeout, NSInteger* outStatus, NSString* stepName) {
+static NSData* http_get_data(NSString* urlStr, NSString* accept, NSTimeInterval timeout, NSString* stepName) {
     NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
     [req setValue:[NSString stringWithFormat:@"Bearer %s", GH_TOKEN] forHTTPHeaderField:@"Authorization"];
     if (accept) [req setValue:accept forHTTPHeaderField:@"Accept"];
@@ -106,7 +108,6 @@ static NSData* http_get_data(NSString* urlStr, NSString* accept, NSTimeInterval 
         }];
     [task resume];
     long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC) + (int64_t)(3 * NSEC_PER_SEC)));
-    if (outStatus) *outStatus = status;
     if (waited != 0) {
         loader_log(@"%@: TIMED OUT", stepName);
     } else if (!result) {
@@ -121,11 +122,9 @@ static NSData* http_get_data(NSString* urlStr, NSString* accept, NSTimeInterval 
 // Tiny hand-rolled scan of GitHub's release JSON — no JSON library needed for
 // two fixed-shape lookups. Whitespace-TOLERANT: GitHub's API doesn't
 // guarantee pretty-printed ("key": "value") vs compact ("key":"value")
-// formatting — a manual curl test during development happened to get pretty
-// output, but the on-device NSURLSession request came back compact and the
-// original space-hardcoded parser found nothing. This version doesn't care
-// either way: after the key, skip whitespace, expect ':', skip whitespace,
-// expect a quoted string value.
+// formatting, and the on-device response came back compact while a manual
+// dev-machine curl test happened to get pretty output. This version skips
+// whitespace around ':' regardless of which style is served.
 static std::string json_string_value_at(const std::string& json, size_t keyEnd) {
     size_t p = keyEnd;
     while (p < json.size() && isspace((unsigned char)json[p])) p++;
@@ -169,70 +168,136 @@ static std::string find_asset_api_url(const std::string& json, const std::string
 }
 
 // ---------------------------------------------------------------------------
-static NSString* cached_dylib_path() {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/BlockpostESP_loaded.dylib"];
+// WHERE to put the downloaded dylib. Documents (inside the app's own sandbox
+// container) turned out to be blocked: iOS's sandbox denies mmap()-as-
+// executable for files there even on a jailbroken/rootless device — this is
+// enforced independently of code signing. The fix: try several
+// jailbreak-writable, non-container locations, starting with wherever THIS
+// loader's own .dylib was itself successfully loaded from (Substrate/dpkg
+// already proved that exact directory supports exec-mmap for us) and falling
+// back to common shared jailbreak paths if that's not writable for some
+// reason. Whichever candidate actually dlopen()s successfully is remembered
+// for next launch instead of re-probing every time.
+static NSString* loader_own_dir() {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char* name = _dyld_get_image_name(i);
+        if (name && strstr(name, "BlockpostESPLoader")) {
+            return [[NSString stringWithUTF8String:name] stringByDeletingLastPathComponent];
+        }
+    }
+    return nil;
 }
+
+static NSArray<NSString*>* candidate_dirs() {
+    NSMutableArray<NSString*>* dirs = [NSMutableArray new];
+    NSString* ownDir = loader_own_dir();
+    if (ownDir) [dirs addObject:ownDir];
+    [dirs addObject:@"/var/mobile/Library/Caches/BlockpostESPLoader"];
+    [dirs addObject:@"/var/tmp/BlockpostESPLoader"];
+    [dirs addObject:@"/var/jb/var/mobile/Library/Caches/BlockpostESPLoader"];   // common rootless prefix
+    [dirs addObject:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]]; // known-blocked, kept as last resort
+    return dirs;
+}
+
+// Small text-only state files — plain read/write, never mmap()'d, so the
+// Documents sandbox restriction that blocks the DYLIB doesn't apply to these.
 static NSString* cached_tag_path() {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/esp_loader_tag.txt"];
 }
+static NSString* working_dir_state_path() {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/esp_loader_workdir.txt"];
+}
 
-static void try_load_cached(NSString* reason) {
-    NSString* path = cached_dylib_path();
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        loader_log(@"%@ — no cached dylib either, nothing to load", reason);
-        return;
+static void* try_write_and_load(NSData* dylibData, NSString* dir) {
+    NSFileManager* fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString* path = [dir stringByAppendingPathComponent:@"BlockpostESP_loaded.dylib"];
+    NSString* tmpPath = [path stringByAppendingString:@".tmp"];
+    if (![dylibData writeToFile:tmpPath atomically:YES]) {
+        loader_log(@"  [%@] write failed (not writable)", dir);
+        return NULL;
     }
-    loader_log(@"%@ — falling back to cached dylib", reason);
+    chmod(tmpPath.fileSystemRepresentation, 0755);
+    [fm removeItemAtPath:path error:nil];
+    NSError* mvErr = nil;
+    if (![fm moveItemAtPath:tmpPath toPath:path error:&mvErr]) {
+        loader_log(@"  [%@] move failed: %@", dir, mvErr.localizedDescription);
+        return NULL;
+    }
     void* h = dlopen(path.fileSystemRepresentation, RTLD_NOW);
-    loader_log(@"cached dlopen: %@ (%s)", h ? @"OK" : @"FAILED", h ? "" : dlerror());
+    if (h) { loader_log(@"  [%@] dlopen SUCCESS", dir); return h; }
+    loader_log(@"  [%@] dlopen failed: %s", dir, dlerror());
+    [fm removeItemAtPath:path error:nil];
+    return NULL;
 }
 
 static void loader_work() {
     @autoreleasepool {
         loader_log(@"start");
-        NSInteger status = 0;
         NSData* relData = http_get_data([NSString stringWithFormat:@"%s/releases/latest", GH_REPO_API],
-                                         @"application/vnd.github+json", 10.0, &status, @"fetch releases/latest");
-        if (!relData) { try_load_cached(@"releases/latest fetch failed"); return; }
+                                         @"application/vnd.github+json", 10.0, @"fetch releases/latest");
+
+        NSString* savedWorkDir = [NSString stringWithContentsOfFile:working_dir_state_path()
+                                                             encoding:NSUTF8StringEncoding error:nil];
+        NSString* savedDylibPath = savedWorkDir.length ? [savedWorkDir stringByAppendingPathComponent:@"BlockpostESP_loaded.dylib"] : nil;
+
+        if (!relData) {
+            // Offline / GitHub unreachable — just try whatever worked last time.
+            if (savedDylibPath && [[NSFileManager defaultManager] fileExistsAtPath:savedDylibPath]) {
+                void* h = dlopen(savedDylibPath.fileSystemRepresentation, RTLD_NOW);
+                loader_log(@"offline reuse [%@]: %@", savedWorkDir, h ? @"SUCCESS" : [NSString stringWithFormat:@"FAILED (%s)", dlerror()]);
+            } else {
+                loader_log(@"no network and nothing cached — nothing to load");
+            }
+            return;
+        }
 
         std::string json((const char*)relData.bytes, relData.length);
         std::string tag = find_tag_name(json);
         std::string assetApiUrl = find_asset_api_url(json, ASSET_NAME);
         loader_log(@"tag=%s assetUrl=%s", tag.empty() ? "?" : tag.c_str(), assetApiUrl.empty() ? "NOT FOUND" : assetApiUrl.c_str());
-        if (tag.empty() || assetApiUrl.empty()) { try_load_cached(@"tag/asset parse failed"); return; }
+        if (tag.empty() || assetApiUrl.empty()) {
+            if (savedDylibPath && [[NSFileManager defaultManager] fileExistsAtPath:savedDylibPath]) {
+                void* h = dlopen(savedDylibPath.fileSystemRepresentation, RTLD_NOW);
+                loader_log(@"parse failed, reuse [%@]: %@", savedWorkDir, h ? @"SUCCESS" : [NSString stringWithFormat:@"FAILED (%s)", dlerror()]);
+            }
+            return;
+        }
 
         NSString* nsTag = [NSString stringWithUTF8String:tag.c_str()];
         NSString* cachedTag = [NSString stringWithContentsOfFile:cached_tag_path()
                                                           encoding:NSUTF8StringEncoding error:nil];
-        BOOL haveCachedFile = [[NSFileManager defaultManager] fileExistsAtPath:cached_dylib_path()];
-        BOOL needDownload = !haveCachedFile || ![cachedTag isEqualToString:nsTag];
-        loader_log(@"cachedTag=%@ haveCachedFile=%d needDownload=%d", cachedTag ?: @"(none)", haveCachedFile, needDownload);
+        BOOL sameTag = [cachedTag isEqualToString:nsTag];
+        BOOL haveWorkingCopy = savedDylibPath && [[NSFileManager defaultManager] fileExistsAtPath:savedDylibPath];
+        loader_log(@"cachedTag=%@ sameTag=%d haveWorkingCopy=%d", cachedTag ?: @"(none)", sameTag, haveWorkingCopy);
 
-        if (needDownload) {
-            NSData* dylibData = http_get_data([NSString stringWithUTF8String:assetApiUrl.c_str()],
-                                               @"application/octet-stream", 30.0, &status, @"download dylib");
-            if (dylibData && dylibData.length > 0) {
-                NSString* tmpPath = [cached_dylib_path() stringByAppendingString:@".tmp"];
-                BOOL wrote = [dylibData writeToFile:tmpPath atomically:YES];
-                loader_log(@"write tmp: %@", wrote ? @"ok" : @"FAILED");
-                if (wrote) {
-                    chmod(tmpPath.fileSystemRepresentation, 0755);
-                    [[NSFileManager defaultManager] removeItemAtPath:cached_dylib_path() error:nil];
-                    NSError* mvErr = nil;
-                    BOOL moved = [[NSFileManager defaultManager] moveItemAtPath:tmpPath toPath:cached_dylib_path() error:&mvErr];
-                    loader_log(@"move into place: %@ %@", moved ? @"ok" : @"FAILED", mvErr.localizedDescription ?: @"");
-                    [nsTag writeToFile:cached_tag_path() atomically:YES
-                              encoding:NSUTF8StringEncoding error:nil];
-                }
-            } else {
-                loader_log(@"download produced no data");
-            }
+        if (sameTag && haveWorkingCopy) {
+            void* h = dlopen(savedDylibPath.fileSystemRepresentation, RTLD_NOW);
+            loader_log(@"reuse cached [%@]: %@", savedWorkDir, h ? @"SUCCESS" : [NSString stringWithFormat:@"FAILED (%s)", dlerror()]);
+            if (h) return;
+            loader_log(@"cached copy stopped working, re-downloading");
         }
 
-        BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:cached_dylib_path()];
-        loader_log(@"cached dylib exists=%d path=%@", exists, cached_dylib_path());
-        void* h = dlopen(cached_dylib_path().fileSystemRepresentation, RTLD_NOW);
-        loader_log(@"dlopen: %@ (%s)", h ? @"SUCCESS" : @"FAILED", h ? "" : dlerror());
+        NSData* dylibData = http_get_data([NSString stringWithUTF8String:assetApiUrl.c_str()],
+                                           @"application/octet-stream", 30.0, @"download dylib");
+        if (!dylibData || dylibData.length == 0) { loader_log(@"download produced no data"); return; }
+
+        loader_log(@"probing candidate directories for one that supports exec...");
+        void* handle = NULL;
+        NSString* workedDir = nil;
+        for (NSString* dir in candidate_dirs()) {
+            void* h = try_write_and_load(dylibData, dir);
+            if (h) { handle = h; workedDir = dir; break; }
+        }
+
+        if (handle) {
+            [nsTag writeToFile:cached_tag_path() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [workedDir writeToFile:working_dir_state_path() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            loader_log(@"LOADED from [%@]", workedDir);
+        } else {
+            loader_log(@"ALL candidate directories failed — see lines above for each one's error");
+        }
     }
 }
 

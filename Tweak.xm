@@ -85,9 +85,17 @@ static uintptr_t g_off_team         = 0x0;       // team int inside the controll
 static float     g_box_height       = 1.8f;      // world units, feet->head
 
 static uintptr_t g_image_base       = 0;
-static bool      g_esp_on           = true;
+static bool      g_esp_on           = false;     // OFF until reads are validated
 static bool      g_enemies_only     = false;     // needs a valid g_off_team first
 static int       g_local_team       = -1;
+
+// Per-capability debug gates. Start with only pure-memory reads enabled; the
+// method-call paths (which can crash if an ABI/addr is wrong) are opt-in so we
+// can bisect the crash on-device without nuking the app every frame.
+static bool      g_dbg_names        = false;     // il2cpp_object_get_class + get_name
+static bool      g_dbg_pos          = false;     // Motor.get_TransientPosition
+static bool      g_dbg_w2s          = false;     // Camera.WorldToScreenPoint
+static int       g_scan_count       = -1;        // cached last scan result
 
 // il2cpp handles (resolved once, refreshed on Apply)
 static void* g_kcs_class = NULL;   // KinematicCharacterSystem
@@ -145,29 +153,35 @@ static void resolve_all() {
     }
 }
 
+// Sanity gate for any pointer we're about to dereference into game memory.
+static inline bool safe_ptr(const void* p) {
+    uintptr_t v = (uintptr_t)p;
+    return v > 0x10000 && (v & 0x7) == 0 && v < 0x0000100000000000ULL;
+}
+
 // Snapshot the current motor list into a plain vector of pointers.
 static int get_motors(std::vector<void*>& out) {
     out.clear();
     if (!g_motors_field || !il2cpp_field_static_get_value) return 0;
     void* listobj = NULL;
     il2cpp_field_static_get_value(g_motors_field, &listobj); // static -> obj ignored
-    if (!listobj) return 0;
+    if (!safe_ptr(listobj)) return 0;
     // System.Collections.Generic.List<T>: _items @0x10 (T[]), _size @0x18 (int)
     void* items = *(void**)((char*)listobj + 0x10);
     int size    = *(int*) ((char*)listobj + 0x18);
-    if (!items || size <= 0 || size > 512) return 0;
+    if (!safe_ptr(items) || size <= 0 || size > 512) return 0;
     // Il2CppArray payload begins at 0x20
     for (int i = 0; i < size; i++) {
         void* m = *(void**)((char*)items + 0x20 + (uintptr_t)i * 8);
-        if (m) out.push_back(m);
+        if (safe_ptr(m)) out.push_back(m);
     }
     return (int)out.size();
 }
 
 static int motor_team(void* motor) {
-    if (!g_off_team) return -999;
+    if (!g_off_team || !safe_ptr(motor)) return -999;
     void* ctrl = *(void**)((char*)motor + g_off_ctrl);
-    if (!ctrl) return -999;
+    if (!safe_ptr(ctrl)) return -999;
     return *(int*)((char*)ctrl + g_off_team);
 }
 
@@ -191,27 +205,29 @@ static std::string build_debug_dump() {
     snprintf(b, sizeof(b), "motors=%d\n", n); o += b;
 
     // dump up to 4 characters: controller class name + first 0x80 bytes so we
-    // can locate the team field, plus position + screen projection
+    // can locate the team field, plus position + screen projection.
+    // Each capability is gated separately so a bad one can be turned off.
     for (int i = 0; i < n && i < 4; i++) {
         void* m = motors[i];
+        if (!safe_ptr(m)) continue;
         void* ctrl = *(void**)((char*)m + g_off_ctrl);
         const char* cname = "?";
-        if (ctrl && il2cpp_object_get_class && il2cpp_class_get_name) {
+        if (g_dbg_names && safe_ptr(ctrl) && il2cpp_object_get_class && il2cpp_class_get_name) {
             void* c = il2cpp_object_get_class(ctrl);
-            if (c) cname = il2cpp_class_get_name(c);
+            if (safe_ptr(c)) cname = il2cpp_class_get_name(c);
         }
         snprintf(b, sizeof(b), "-- motor[%d]=%p ctrl=%p (%s) --\n", i, m, ctrl, cname); o += b;
 
-        if (Motor_get_TP) {
+        if (g_dbg_pos && Motor_get_TP) {
             Vector3 p = Motor_get_TP(m, NULL);
             snprintf(b, sizeof(b), "   pos=(%.2f,%.2f,%.2f)", p.x, p.y, p.z); o += b;
-            if (cam && W2S) {
-                Vector3 s; W2S(cam, &p, &s, NULL);
+            if (g_dbg_w2s && cam && W2S) {
+                Vector3 s = {0,0,0}; W2S(cam, &p, &s, NULL);
                 snprintf(b, sizeof(b), "  screen=(%.1f,%.1f,z=%.2f)", s.x, s.y, s.z); o += b;
             }
             o += "\n";
         }
-        if (ctrl) {
+        if (safe_ptr(ctrl)) {
             unsigned char* bytes = (unsigned char*)ctrl;
             for (int row = 0; row < 0x80; row += 16) {
                 snprintf(b, sizeof(b), "   +0x%02x: ", row); o += b;
@@ -258,13 +274,23 @@ static void render_frame(float screenW, float screenH) {
         }
 
         ImGui::SeparatorText("State");
-        void* cam = Camera_get_main ? Camera_get_main(NULL) : NULL;
-        std::vector<void*> motors; int n = get_motors(motors);
-        ImGui::Text("base=0x%lx  cam=%p", (unsigned long)g_image_base, cam);
-        ImGui::Text("motors=%d  class=%p field=%p", n, g_kcs_class, g_motors_field);
+        ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
+        ImGui::Text("class=%p field=%p", g_kcs_class, g_motors_field);
+        ImGui::Text("last scan motors=%d", g_scan_count);
 
-        g_debug_text = build_debug_dump();
+        ImGui::SeparatorText("Self-test (enable one at a time)");
+        ImGui::TextDisabled("if a step crashes, that call is the culprit");
+        // pure-memory scan: no method calls, safe
+        if (ImGui::Button("1. Scan list")) {
+            std::vector<void*> mv; g_scan_count = get_motors(mv);
+        }
+        // opt-in method-call gates
+        ImGui::Checkbox("2. class names (il2cpp)", &g_dbg_names);
+        ImGui::Checkbox("3. positions (get_TransientPosition)", &g_dbg_pos);
+        ImGui::Checkbox("4. project (WorldToScreenPoint)", &g_dbg_w2s);
+
         if (ImGui::Button("Copy Debug")) {
+            g_debug_text = build_debug_dump();   // built only on demand
             [UIPasteboard generalPasteboard].string =
                 [NSString stringWithUTF8String:g_debug_text.c_str()];
         }

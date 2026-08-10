@@ -97,7 +97,11 @@ static char      g_target_ns[64]  = "";        // BotAI / Player have no namespa
 static char      g_target_cls[64] = "BotAI";   // what to draw boxes on
 static uintptr_t g_off_tf         = 0x20;      // Transform field inside target (BotAI._meshesRoot)
 static uintptr_t g_off_team       = 0x0;       // team int inside target (0 = disabled)
-static int       g_pos_mode       = 0;         // 0 = field @g_off_tf, 1 = Component.get_transform(self)
+// pos_mode 1 (Component.get_transform(self), the BotAI component's OWN root
+// transform) is confirmed correct on-target; pos_mode 0 (_meshesRoot field)
+// projects to some other anchor entirely (a decoration/effect socket, not
+// the body) and was the source of the "floats above the character" bug.
+static int       g_pos_mode       = 1;         // 0 = field @g_off_tf, 1 = Component.get_transform(self)
 static float     g_head_off       = 0.2f;      // world units from anchor up to box TOP
 static float     g_feet_off       = -1.9f;     // world units from anchor down to box BOTTOM
 static float     g_width_mult     = 0.45f;     // box width as fraction of its height
@@ -130,6 +134,23 @@ static void*     g_plh_fld   = NULL;    // the static field handle for the array
 static int       g_plh_field_score = -1; // how many entries in the auto-picked field looked like real players
 static float     g_pd_head_off = 1.6f;  // Pos is at feet-ish -> box top above
 static float     g_pd_feet_off = -0.1f; // small drop below Pos to feet
+
+// --- Real skeleton anchors, exactly like the Android source's Esp::Render ---
+// PlayerData.po -> PlayerObject; PlayerObject.tr (0xF8) is a single base/legs
+// Transform, PlayerObject.trhb (0x100) is a Transform[] of bones indexed by
+// PlayerBones_t (head=3, chest=2, lowerChest=1, stomach=0, arms=4..6/10..12,
+// legs=7..8/13..14). Verified byte-for-byte against the BPM 260720 dump — same
+// offsets as the Android build, no shift (PlayerObject is a different class
+// than PlayerData, so the +8 insertion there doesn't apply here). When these
+// resolve, box top/bottom AND a full skeleton use real bone positions instead
+// of a flat Pos field — this is what the source actually does.
+static uintptr_t g_pd_po     = 0x30;    // PlayerData.po -> PlayerObject
+static uintptr_t g_po_tr     = 0xf8;    // PlayerObject.tr  (Transform, base/legs)
+static uintptr_t g_po_trhb   = 0x100;   // PlayerObject.trhb (Transform[], bones)
+enum BoneIdx { BONE_STOMACH=0, BONE_LOWERCHEST=1, BONE_CHEST=2, BONE_HEAD=3,
+               BONE_R_UPARM=4, BONE_R_LOARM=5, BONE_R_HAND=6, BONE_R_UPLEG=7, BONE_R_LOLEG=8,
+               BONE_L_UPARM=10, BONE_L_LOARM=11, BONE_L_HAND=12, BONE_L_UPLEG=13, BONE_L_LOLEG=14 };
+static bool      g_skeleton_on = false;
 
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
@@ -288,6 +309,36 @@ static int score_plh_field(void* fld) {
         good++;
     }
     return good;
+}
+
+// Real per-bone anchors for a PLH player, mirroring the source's
+// PlayerSystem::getObject/getTransform/getTransforms + Esp::Render. Returns
+// false (leaving outputs untouched) if this player's PlayerObject/bones
+// aren't available — caller should fall back to the flat Pos-based box.
+static bool get_bone_pos(void* pd, int boneIdx, Vector3& outPos) {
+    if (!safe_ptr(pd) || !Tf_get_pos) return false;
+    void* po = *(void**)((char*)pd + g_pd_po);
+    if (!safe_ptr(po)) return false;
+    void* trhbArr = *(void**)((char*)po + g_po_trhb);
+    if (!safe_ptr(trhbArr)) return false;
+    int cnt = *(int*)((char*)trhbArr + 0x18);
+    if (boneIdx < 0 || boneIdx >= cnt) return false;
+    void* bone = *(void**)((char*)trhbArr + 0x20 + (uintptr_t)boneIdx * 8);
+    if (!safe_ptr(bone)) return false;
+    outPos = Tf_get_pos(bone, NULL);
+    return true;
+}
+
+// The "base" anchor (PlayerObject.tr) used for the legs/bottom of the box —
+// distinct from any bone, this is the character's own root transform.
+static bool get_base_pos(void* pd, Vector3& outPos) {
+    if (!safe_ptr(pd) || !Tf_get_pos) return false;
+    void* po = *(void**)((char*)pd + g_pd_po);
+    if (!safe_ptr(po)) return false;
+    void* tr = *(void**)((char*)po + g_po_tr);
+    if (!safe_ptr(tr)) return false;
+    outPos = Tf_get_pos(tr, NULL);
+    return true;
 }
 
 // Resolve exactly like the Android source: NO il2cpp_domain_get (that hung),
@@ -504,6 +555,13 @@ static std::vector<Box>  g_boxes;
 struct CalibMarks { bool valid; float x0, y0, x1, y1; };
 static std::mutex   g_calib_mtx;
 static CalibMarks   g_calib = { false, 0, 0, 0, 0 };
+
+// Skeleton line segments (PLH mode only — needs PlayerObject.trhb bones,
+// which BotAI doesn't expose), computed on the main thread and drawn by the
+// render thread same as boxes.
+struct SkelSeg { float x1, y1, x2, y2; };
+static std::mutex           g_skel_mtx;
+static std::vector<SkelSeg> g_skel_segs;
 static bool              g_want_resolve = false;   // button -> main thread does resolve_all
 static bool              g_want_debug   = false;   // button -> main thread builds debug dump
 static bool              g_want_replh   = false;   // button -> main thread re-resolves PLH class/field
@@ -548,6 +606,8 @@ static void compute_boxes() {
             // hitbox/proxy) and only the first is kept.
             const float DEDUP_DIST2 = 0.3f * 0.3f;
             std::vector<Vector3> accepted;
+            std::vector<SkelSeg> skelSegs;
+            const float aspect = (screenH > 0) ? (screenW / screenH) : 1.7778f;
             for (void* obj : targets) {
                 Vector3 anchor; float headoff, feetoff;
                 if (plh) {
@@ -577,6 +637,15 @@ static void compute_boxes() {
                 if (dup) continue;
                 accepted.push_back(anchor);
 
+                // Prefer real bone anchors (matches the source exactly): head
+                // bone for the top, the character's own base transform for
+                // the bottom. Only PLH targets expose PlayerObject.trhb; if
+                // it's missing (or we're in BotAI mode) fall back to the
+                // flat single-anchor + slider-offset method.
+                bool haveBones = false;
+                Vector3 headBone{}, basePos{};
+                if (plh) haveBones = get_bone_pos(obj, BONE_HEAD, headBone) && get_base_pos(obj, basePos);
+
                 if (!calibDone) {
                     Vector3 p0 = anchor;
                     Vector3 p1 = anchor; p1.y += 1.0f;
@@ -592,8 +661,14 @@ static void compute_boxes() {
                     }
                 }
 
-                Vector3 top = anchor; top.y += headoff;
-                Vector3 bot = anchor; bot.y += feetoff;
+                Vector3 top, bot;
+                if (haveBones) {
+                    top = headBone; top.y += 0.42f;   // clear the top of the head, per the source
+                    bot = basePos;  bot.y += -0.10f;  // just below the base transform, per the source
+                } else {
+                    top = anchor; top.y += headoff;
+                    bot = anchor; bot.y += feetoff;
+                }
                 Vector3 sTop = W2S(cam, top, NULL);
                 Vector3 sBot = W2S(cam, bot, NULL);
                 if (sBot.z <= 0.0f || sTop.z <= 0.0f) continue;
@@ -604,12 +679,36 @@ static void compute_boxes() {
                 float cx = (uxTop + uxBot) * 0.5f;
                 if (cx <= 0 || cx >= screenW) continue;
                 float h = botY - topY; if (h < 6) h = 6;
-                float w = h * g_width_mult;
+                // Real bone anchors get the source's aspect-corrected width
+                // formula; the flat-anchor fallback keeps its own tuned
+                // g_width_mult (changing that formula would break BotAI mode,
+                // which is already confirmed correctly proportioned).
+                float w = haveBones ? (h * 0.60f * (2.0f / aspect)) : (h * g_width_mult);
+
+                if (haveBones && g_skeleton_on) {
+                    static const int pairs[][2] = {
+                        {BONE_L_UPLEG,BONE_L_LOLEG}, {BONE_L_LOARM,BONE_L_HAND}, {BONE_L_UPARM,BONE_L_LOARM},
+                        {BONE_HEAD,BONE_L_UPARM}, {BONE_HEAD,BONE_CHEST}, {BONE_CHEST,BONE_LOWERCHEST},
+                        {BONE_R_UPLEG,BONE_R_LOLEG}, {BONE_LOWERCHEST,BONE_R_UPLEG}, {BONE_R_UPARM,BONE_HEAD},
+                        {BONE_R_UPARM,BONE_R_LOARM}, {BONE_R_HAND,BONE_R_LOARM}, {BONE_LOWERCHEST,BONE_L_UPLEG},
+                    };
+                    for (auto& pr : pairs) {
+                        Vector3 a, b;
+                        if (!get_bone_pos(obj, pr[0], a) || !get_bone_pos(obj, pr[1], b)) continue;
+                        Vector3 sa = W2S(cam, a, NULL), sb = W2S(cam, b, NULL);
+                        if (sa.z <= 0.0f || sb.z <= 0.0f) continue;
+                        float ax, ay, bx, by;
+                        toUI(sa, ax, ay); toUI(sb, bx, by);
+                        skelSegs.push_back(SkelSeg{ax, ay, bx, by});
+                    }
+                }
                 boxes.push_back(Box{ cx - w*0.5f, topY, w, h });
             }
+            { std::lock_guard<std::mutex> l(g_skel_mtx); g_skel_segs.swap(skelSegs); }
         }
     }
     if (!calibDone) { std::lock_guard<std::mutex> l(g_calib_mtx); g_calib.valid = false; }
+    if (!(g_esp_on && g_skeleton_on)) { std::lock_guard<std::mutex> l(g_skel_mtx); g_skel_segs.clear(); }
     { std::lock_guard<std::mutex> l(g_boxes_mtx); g_boxes.swap(boxes); }
 }
 
@@ -667,7 +766,12 @@ static void render_frame(float screenW, float screenH) {
             ImGui::SameLine();
             if (ImGui::Button("Reset##bot")) { g_head_off = 0.2f; g_feet_off = -1.9f; }
         }
-        ImGui::SliderFloat("Box width", &g_width_mult, 0.1f, 1.0f);
+        if (g_esp_src != 1) ImGui::SliderFloat("Box width", &g_width_mult, 0.1f, 1.0f);
+
+        if (g_esp_src == 1) {
+            ImGui::Checkbox("Skeleton (real bones)", &g_skeleton_on);
+            ImGui::SameLine(); ImGui::TextDisabled("(PLH only — needs PlayerObject.trhb)");
+        }
 
         if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {
             ImGui::InputText("image", g_image_name, sizeof(g_image_name));
@@ -687,7 +791,7 @@ static void render_frame(float screenW, float screenH) {
             ImGui::SameLine();
             if (ImGui::Button("Target = BotAI")) {
                 strcpy(g_target_cls, "BotAI"); g_target_ns[0] = 0;
-                g_pos_mode = 0; g_off_tf = 0x20;
+                g_pos_mode = 1; g_off_tf = 0x20;   // get_transform() is the confirmed-correct anchor
                 g_want_resolve = true;
             }
         }
@@ -742,6 +846,14 @@ static void render_frame(float screenW, float screenH) {
             ImVec2 tl(b.x, b.y), br(b.x + b.w, b.y + b.h);
             dl->AddRect(ImVec2(tl.x-1,tl.y-1), ImVec2(br.x+1,br.y+1), IM_COL32(0,0,0,180), 0,0,3.0f);
             dl->AddRect(tl, br, IM_COL32(255,40,40,255), 0,0,1.5f);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> l(g_skel_mtx);
+        if (!g_skel_segs.empty()) {
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            for (const SkelSeg& s : g_skel_segs)
+                dl->AddLine(ImVec2(s.x1, s.y1), ImVec2(s.x2, s.y2), IM_COL32(80,220,255,255), 1.5f);
         }
     }
     // Calibration dots: yellow = raw anchor (zero offset), cyan = anchor +1
@@ -868,8 +980,9 @@ static void setup_overlay() {
     [g_window makeKeyAndVisible];
 
     // Main-thread pump: ALL il2cpp/game reads happen here, never on the render
-    // thread. ~30 Hz is plenty for ESP and keeps the main runloop light.
-    [NSTimer scheduledTimerWithTimeInterval:1.0/30.0 repeats:YES
+    // thread. Matched to the render thread's 60fps so boxes update every
+    // drawn frame instead of visibly lagging behind at half rate.
+    [NSTimer scheduledTimerWithTimeInterval:1.0/60.0 repeats:YES
                                       block:^(NSTimer* t) { main_pump(); }];
 }
 

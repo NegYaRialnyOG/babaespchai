@@ -1,9 +1,10 @@
-// Blockpost Mobile 2D Box ESP — NeqYaRialnyOG & Nyx
+// Blockpost Mobile 2D Box ESP + Offset Explorer — NeqYaRialnyOG & Nyx
 // Overlay Dear ImGui menu on our own MTKView (no Metal hook, no MSHookFunction).
 //
-// Enemies are enumerated with UnityEngine.Object.FindObjectsOfType(Type) so we
-// don't depend on any single game-specific list (KCC motors only ever held the
-// local player). Everything is resolved by RVA against UnityFramework and is
+// Targets are enumerated with UnityEngine.Object.FindObjectsOfType(Type) every
+// frame (NO cached raw pointers — that was the ~6s use-after-free crash: a bot
+// spawned/despawned, the cached pointer went stale, next frame we dereferenced
+// freed memory). Everything is resolved by RVA against UnityFramework and is
 // live-tunable from the debug menu. Resolved for BLOCKPOSTMOBILE build 260206.
 
 #import <UIKit/UIKit.h>
@@ -25,11 +26,13 @@ typedef Vector3 (*Cam_W2S_t)(void* camera, Vector3 pos, void* method);      // C
 typedef void*   (*Cam_get_main_t)(void* method);                            // Camera.get_main
 typedef Vector3 (*Tf_get_pos_t)(void* transform, void* method);            // Transform.get_position
 typedef void*   (*FindObjs_t)(void* type, void* method);                    // Object.FindObjectsOfType(Type)
+typedef void*   (*Comp_get_tf_t)(void* component, void* method);           // Component.get_transform
 
 static Cam_W2S_t      W2S             = NULL;
 static Cam_get_main_t Camera_get_main = NULL;
 static Tf_get_pos_t   Tf_get_pos      = NULL;
 static FindObjs_t     FindObjs        = NULL;
+static Comp_get_tf_t  Comp_get_tf     = NULL;
 
 // il2cpp runtime API (bound by RVA — these aren't in the export trie)
 typedef void* (*il2cpp_domain_get_t)();
@@ -55,6 +58,7 @@ static il2cpp_class_get_name_t       il2cpp_class_get_name       = NULL;
 #define RVA_GET_MAIN         0x321c3d4   // Camera.get_main
 #define RVA_TF_POS           0x325da48   // Transform.get_position -> Vector3
 #define RVA_FINDOBJS         0x3258d94   // Object.FindObjectsOfType(Type) -> Object[]
+#define RVA_GET_TRANSFORM    0x3252f14   // Component.get_transform -> Transform
 
 #define RVA_il2cpp_domain_get            0x10afe4c
 #define RVA_il2cpp_domain_assembly_open  0x10afe50
@@ -67,13 +71,14 @@ static il2cpp_class_get_name_t       il2cpp_class_get_name       = NULL;
 
 // Live-tunable target -------------------------------------------------------
 static char      g_image_name[64] = "UnityFramework";
-static char      g_target_ns[64]  = "";       // BotAI has no namespace
-static char      g_target_cls[64] = "BotAI";  // what to draw boxes on
-static uintptr_t g_off_tf         = 0x20;     // Transform field inside target (BotAI._meshesRoot)
-static uintptr_t g_off_team       = 0x0;      // team int inside target (unknown yet -> off)
-static float     g_head_off       = 0.2f;     // world units from anchor up to box TOP
-static float     g_feet_off       = -1.9f;    // world units from anchor down to box BOTTOM
-static float     g_width_mult     = 0.45f;    // box width as fraction of its height
+static char      g_target_ns[64]  = "";        // BotAI / Player have no namespace
+static char      g_target_cls[64] = "BotAI";   // what to draw boxes on
+static uintptr_t g_off_tf         = 0x20;      // Transform field inside target (BotAI._meshesRoot)
+static uintptr_t g_off_team       = 0x0;       // team int inside target (0 = disabled)
+static int       g_pos_mode       = 0;         // 0 = field @g_off_tf, 1 = Component.get_transform(self)
+static float     g_head_off       = 0.2f;      // world units from anchor up to box TOP
+static float     g_feet_off       = -1.9f;     // world units from anchor down to box BOTTOM
+static float     g_width_mult     = 0.45f;     // box width as fraction of its height
 
 static uintptr_t g_image_base = 0;
 static void*     g_img        = NULL;   // Assembly-CSharp image
@@ -94,6 +99,22 @@ static std::string g_debug_text;
 static inline bool safe_ptr(const void* p) {
     uintptr_t v = (uintptr_t)p;
     return v > 0x10000 && (v & 0x7) == 0 && v < 0x0000100000000000ULL;
+}
+
+// A pointer that could be an il2cpp object: first qword is a plausible klass ptr.
+static const char* obj_class_name(void* p) {
+    if (!safe_ptr(p) || !il2cpp_class_get_name) return NULL;
+    void* klass = *(void**)p;                 // il2cpp object header: +0x0 = Il2CppClass*
+    if (!safe_ptr(klass)) return NULL;
+    const char* n = il2cpp_class_get_name(klass);
+    if (!n) return NULL;
+    // sanity: printable, reasonable length
+    for (int i = 0; i < 48; i++) {
+        char c = n[i];
+        if (c == 0) return i > 0 ? n : NULL;
+        if (c < 0x20 || c > 0x7e) return NULL;
+    }
+    return NULL;
 }
 
 static uintptr_t image_header_for(const char* needle) {
@@ -123,6 +144,7 @@ static void resolve_all() {
     Camera_get_main = (Cam_get_main_t)(B + RVA_GET_MAIN);
     Tf_get_pos      = (Tf_get_pos_t)  (B + RVA_TF_POS);
     FindObjs        = (FindObjs_t)    (B + RVA_FINDOBJS);
+    Comp_get_tf     = (Comp_get_tf_t) (B + RVA_GET_TRANSFORM);
 
     il2cpp_domain_get           = (il2cpp_domain_get_t)          (B + RVA_il2cpp_domain_get);
     il2cpp_domain_assembly_open = (il2cpp_domain_assembly_open_t)(B + RVA_il2cpp_domain_assembly_open);
@@ -139,12 +161,12 @@ static void resolve_all() {
     g_type_obj = type_object_for(g_target_ns, g_target_cls);
 }
 
-// Enumerate live instances of the target class. Object[] layout: count @0x18,
-// element pointers begin @0x20.
-static int find_targets(std::vector<void*>& out) {
+// Enumerate live instances of a Type object. Object[] layout: count @0x18,
+// element pointers begin @0x20. Result pointers are valid ONLY this frame.
+static int enum_type(void* type_obj, std::vector<void*>& out) {
     out.clear();
-    if (!FindObjs || !g_type_obj) return 0;
-    void* arr = FindObjs(g_type_obj, NULL);
+    if (!FindObjs || !type_obj) return 0;
+    void* arr = FindObjs(type_obj, NULL);
     if (!safe_ptr(arr)) return 0;
     int cnt = *(int*)((char*)arr + 0x18);
     if (cnt <= 0 || cnt > 1024) return 0;
@@ -155,9 +177,19 @@ static int find_targets(std::vector<void*>& out) {
     return (int)out.size();
 }
 
+static int find_targets(std::vector<void*>& out) { return enum_type(g_type_obj, out); }
+
+// Resolve an object's world position. mode 0: Transform field @g_off_tf.
+// mode 1: Component.get_transform(self) — works for any MonoBehaviour (Player).
 static bool obj_pos(void* o, Vector3& outp) {
     if (!safe_ptr(o) || !Tf_get_pos) return false;
-    void* tf = *(void**)((char*)o + g_off_tf);
+    void* tf = NULL;
+    if (g_pos_mode == 1) {
+        if (!Comp_get_tf) return false;
+        tf = Comp_get_tf(o, NULL);
+    } else {
+        tf = *(void**)((char*)o + g_off_tf);
+    }
     if (!safe_ptr(tf)) return false;
     outp = Tf_get_pos(tf, NULL);
     return true;
@@ -181,19 +213,43 @@ static int probe_count(const char* ns, const char* name, void** first) {
 }
 
 // ---------------------------------------------------------------------------
+// Offset explorer: dump one instance's first 0x140 bytes, decoding each qword
+// as int/float and — when it looks like an il2cpp object pointer — its class
+// name. That reveals Transform fields (name "Transform"), and int slots in
+// plausible team/health ranges. On-demand only (never per-frame).
+static std::string scan_object(void* o) {
+    char b[256]; std::string s;
+    if (!safe_ptr(o)) return "scan: bad object\n";
+    snprintf(b, sizeof(b), "scan obj=%p  (int/float/ptr per offset)\n", o); s += b;
+    unsigned char* by = (unsigned char*)o;
+    for (uintptr_t off = 0; off < 0x140; off += 8) {
+        uint64_t q  = *(uint64_t*)(by + off);
+        int32_t  iv = *(int32_t*)(by + off);
+        float    fv = *(float*)(by + off);
+        const char* cn = NULL;
+        if (safe_ptr((void*)q)) cn = obj_class_name((void*)q);
+        snprintf(b, sizeof(b), "+0x%03lx: i=%-11d f=%-14.3f ptr=0x%012llx%s%s\n",
+                 (unsigned long)off, iv, fv, (unsigned long long)q,
+                 cn ? "  -> " : "", cn ? cn : "");
+        s += b;
+    }
+    return s;
+}
+
 static std::string build_debug_dump() {
     char b[512]; std::string o;
     snprintf(b, sizeof(b), "=== Blockpost ESP debug ===\nimage=%s base=0x%lx\n"
-             "target=%s.%s off_tf=0x%lx off_team=0x%lx\n",
+             "target=%s.%s off_tf=0x%lx off_team=0x%lx pos_mode=%d\n",
              g_image_name, (unsigned long)g_image_base,
-             g_target_ns, g_target_cls, (unsigned long)g_off_tf, (unsigned long)g_off_team);
+             g_target_ns, g_target_cls, (unsigned long)g_off_tf,
+             (unsigned long)g_off_team, g_pos_mode);
     o += b;
     snprintf(b, sizeof(b), "img=%p type_obj=%p cam=%p\n",
              g_img, g_type_obj, Camera_get_main ? Camera_get_main(NULL) : NULL); o += b;
 
     // probe likely classes so we see which one actually has instances
     struct { const char* ns; const char* n; } cand[] = {
-        {"", "BotAI"}, {"", "Player"},
+        {"", "Player"}, {"", "BotAI"}, {"", "BotSpawner"},
         {"KinematicCharacterController.Examples", "ExampleCharacterController"},
         {"KinematicCharacterController", "KinematicCharacterMotor"},
     };
@@ -211,10 +267,7 @@ static std::string build_debug_dump() {
     for (int i = 0; i < n && i < 4; i++) {
         void* obj = t[i];
         const char* cname = "?";
-        if (g_dbg_names && il2cpp_object_get_class && il2cpp_class_get_name) {
-            void* c = il2cpp_object_get_class(obj);
-            if (safe_ptr(c)) cname = il2cpp_class_get_name(c);
-        }
+        if (g_dbg_names) { const char* c = obj_class_name(obj); if (c) cname = c; }
         snprintf(b, sizeof(b), "obj[%d]=%p (%s)\n", i, obj, cname); o += b;
 
         if (g_dbg_pos) {
@@ -228,14 +281,7 @@ static std::string build_debug_dump() {
                 o += "\n";
             }
         }
-        if (safe_ptr(obj)) {
-            unsigned char* by = (unsigned char*)obj;
-            for (int row = 0; row < 0x60; row += 16) {
-                snprintf(b, sizeof(b), "   +0x%02x: ", row); o += b;
-                for (int c = 0; c < 16; c++) { snprintf(b, sizeof(b), "%02x ", by[row+c]); o += b; }
-                snprintf(b, sizeof(b), " i=%d f=%.2f\n", *(int*)(by+row), *(float*)(by+row)); o += b;
-            }
-        }
+        if (i == 0) o += scan_object(obj);   // full offset scan of first instance
     }
     return o;
 }
@@ -244,16 +290,12 @@ static std::string build_debug_dump() {
 static std::mutex          g_rects_mtx;
 static std::vector<CGRect> g_capture_rects;
 
-// cached enumeration for ESP (refreshed at low rate)
-static std::vector<void*> g_cache;
-static int                g_cache_frame = 0;
-
 static void render_frame(float screenW, float screenH) {
     std::vector<CGRect> rects;
 
     ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(30, 40), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(360, 9999));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(380, 9999));
     ImGui::Begin("Blockpost ESP");
     {
         ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
@@ -270,22 +312,36 @@ static void render_frame(float screenW, float screenH) {
             ImGui::InputText("image", g_image_name, sizeof(g_image_name));
             ImGui::InputText("namespace", g_target_ns, sizeof(g_target_ns));
             ImGui::InputText("class", g_target_cls, sizeof(g_target_cls));
+            ImGui::RadioButton("pos: field", &g_pos_mode, 0); ImGui::SameLine();
+            ImGui::RadioButton("pos: get_transform()", &g_pos_mode, 1);
             ImGui::InputScalar("tf off",   ImGuiDataType_U64, &g_off_tf,   0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
             ImGui::InputScalar("team off", ImGuiDataType_U64, &g_off_team, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
             if (ImGui::Button("Apply / Re-resolve")) resolve_all();
+            ImGui::SameLine();
+            if (ImGui::Button("Target = Player")) {
+                strcpy(g_target_cls, "Player"); g_target_ns[0] = 0;
+                g_pos_mode = 1;               // Player: position via get_transform()
+                resolve_all();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Target = BotAI")) {
+                strcpy(g_target_cls, "BotAI"); g_target_ns[0] = 0;
+                g_pos_mode = 0; g_off_tf = 0x20;
+                resolve_all();
+            }
         }
 
         ImGui::SeparatorText("State");
         ImGui::Text("base=0x%lx img=%p", (unsigned long)g_image_base, g_img);
         ImGui::Text("type_obj=%p  last scan=%d", g_type_obj, g_scan_count);
 
-        ImGui::SeparatorText("Self-test (enable one at a time)");
-        if (ImGui::Button("1. Scan")) { std::vector<void*> v; g_scan_count = find_targets(v); }
+        ImGui::SeparatorText("Self-test / offset explorer");
+        if (ImGui::Button("1. Scan count")) { std::vector<void*> v; g_scan_count = find_targets(v); }
         ImGui::Checkbox("2. class names", &g_dbg_names);
         ImGui::Checkbox("3. positions", &g_dbg_pos);
         ImGui::Checkbox("4. project (W2S)", &g_dbg_w2s);
 
-        if (ImGui::Button("Copy Debug")) {
+        if (ImGui::Button("Copy Debug (probe + scan)")) {
             g_debug_text = build_debug_dump();
             [UIPasteboard generalPasteboard].string =
                 [NSString stringWithUTF8String:g_debug_text.c_str()];
@@ -294,12 +350,14 @@ static void render_frame(float screenW, float screenH) {
     }
     ImGui::End();
 
+    // ESP: enumerate FRESH this frame and use immediately (no stale cache).
     if (g_esp_on && W2S && Camera_get_main && Tf_get_pos && g_type_obj) {
-        if (++g_cache_frame % 15 == 0 || g_cache.empty()) find_targets(g_cache);
+        std::vector<void*> targets;
+        find_targets(targets);
         void* cam = Camera_get_main(NULL);
         if (cam) {
             ImDrawList* dl = ImGui::GetForegroundDrawList();
-            for (void* obj : g_cache) {
+            for (void* obj : targets) {
                 if (g_enemies_only && g_off_team && g_local_team >= 0) {
                     int tm = obj_team(obj);
                     if (tm == g_local_team) continue;
@@ -310,10 +368,10 @@ static void render_frame(float screenW, float screenH) {
                 Vector3 bot = anchor; bot.y += g_feet_off;
                 Vector3 sTop = W2S(cam, top, NULL);
                 Vector3 sBot = W2S(cam, bot, NULL);
-                if (sBot.z <= 0.0f) continue;           // behind camera
-                float botY = screenH - sBot.y;          // Unity bottom-left -> UIKit top-left
+                if (sBot.z <= 0.0f || sTop.z <= 0.0f) continue;   // behind camera
+                float botY = screenH - sBot.y;      // Unity bottom-left -> UIKit top-left
                 float topY = screenH - sTop.y;
-                float cx = sBot.x;
+                float cx   = (sTop.x + sBot.x) * 0.5f;
                 if (cx <= 0 || cx >= screenW) continue;
                 float h = botY - topY; if (h < 6) h = 6;
                 float w = h * g_width_mult;

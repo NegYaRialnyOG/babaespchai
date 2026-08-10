@@ -19,6 +19,7 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <string>
+#include <cctype>
 
 // Read-only, single-repo-scoped fine-grained PAT (Contents: Read-only on
 // babaespchai only). Injected at BUILD TIME from the GitHub Actions secret
@@ -118,33 +119,53 @@ static NSData* http_get_data(NSString* urlStr, NSString* accept, NSTimeInterval 
 
 // ---------------------------------------------------------------------------
 // Tiny hand-rolled scan of GitHub's release JSON — no JSON library needed for
-// two fixed-shape lookups. Verified against the real API response shape:
-// "tag_name": "..." at the top level, and each entry in "assets" has its own
-// "url" (the API url to hit for downloading THAT asset) immediately before
-// its "name".
-static std::string json_find_after(const std::string& json, const std::string& key, size_t from = 0) {
-    size_t pos = json.find(key, from);
-    if (pos == std::string::npos) return "";
-    size_t start = pos + key.size();
-    size_t end = json.find("\"", start);
+// two fixed-shape lookups. Whitespace-TOLERANT: GitHub's API doesn't
+// guarantee pretty-printed ("key": "value") vs compact ("key":"value")
+// formatting — a manual curl test during development happened to get pretty
+// output, but the on-device NSURLSession request came back compact and the
+// original space-hardcoded parser found nothing. This version doesn't care
+// either way: after the key, skip whitespace, expect ':', skip whitespace,
+// expect a quoted string value.
+static std::string json_string_value_at(const std::string& json, size_t keyEnd) {
+    size_t p = keyEnd;
+    while (p < json.size() && isspace((unsigned char)json[p])) p++;
+    if (p >= json.size() || json[p] != ':') return "";
+    p++;
+    while (p < json.size() && isspace((unsigned char)json[p])) p++;
+    if (p >= json.size() || json[p] != '"') return "";
+    p++;
+    size_t end = json.find('"', p);
     if (end == std::string::npos) return "";
-    return json.substr(start, end - start);
+    return json.substr(p, end - p);
 }
 
 static std::string find_tag_name(const std::string& json) {
-    return json_find_after(json, "\"tag_name\": \"");
+    std::string keyPat = "\"tag_name\"";
+    size_t pos = json.find(keyPat);
+    if (pos == std::string::npos) return "";
+    return json_string_value_at(json, pos + keyPat.size());
 }
 
 // Returns the asset's own API "url" (the one that must be hit with
 // Accept: application/octet-stream to actually download it — the plain
-// browser_download_url doesn't work headlessly for a private repo).
+// browser_download_url doesn't work headlessly for a private repo). Scans
+// every "name" occurrence for one whose value matches wantName, then looks
+// backward for that same asset object's "url" field.
 static std::string find_asset_api_url(const std::string& json, const std::string& wantName) {
-    std::string nameNeedle = "\"name\": \"" + wantName + "\"";
-    size_t namePos = json.find(nameNeedle);
-    if (namePos == std::string::npos) return "";
-    size_t urlKeyPos = json.rfind("\"url\": \"", namePos);
-    if (urlKeyPos == std::string::npos) return "";
-    return json_find_after(json, "\"url\": \"", urlKeyPos);
+    std::string nameKeyPat = "\"name\"";
+    size_t searchFrom = 0;
+    while (true) {
+        size_t keyPos = json.find(nameKeyPat, searchFrom);
+        if (keyPos == std::string::npos) return "";
+        std::string val = json_string_value_at(json, keyPos + nameKeyPat.size());
+        if (val == wantName) {
+            std::string urlKeyPat = "\"url\"";
+            size_t urlKeyPos = json.rfind(urlKeyPat, keyPos);
+            if (urlKeyPos == std::string::npos) return "";
+            return json_string_value_at(json, urlKeyPos + urlKeyPat.size());
+        }
+        searchFrom = keyPos + nameKeyPat.size();
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -28,12 +28,15 @@ typedef void*   (*Cam_get_main_t)(void* method);                            // C
 typedef Vector3 (*Tf_get_pos_t)(void* transform, void* method);            // Transform.get_position
 typedef void*   (*FindObjs_t)(void* type, void* method);                    // Object.FindObjectsOfType(Type)
 typedef void*   (*Comp_get_tf_t)(void* component, void* method);           // Component.get_transform
+typedef int32_t (*Cam_pixelDim_t)(void* camera, void* method);             // Camera.get_pixelWidth/Height
 
 static Cam_W2S_t      W2S             = NULL;
 static Cam_get_main_t Camera_get_main = NULL;
 static Tf_get_pos_t   Tf_get_pos      = NULL;
 static FindObjs_t     FindObjs        = NULL;
 static Comp_get_tf_t  Comp_get_tf     = NULL;
+static Cam_pixelDim_t Camera_get_pixelWidth  = NULL;
+static Cam_pixelDim_t Camera_get_pixelHeight = NULL;
 
 // il2cpp runtime API (bound by RVA — these aren't in the export trie)
 typedef void* (*il2cpp_domain_get_t)();
@@ -72,6 +75,8 @@ static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value    = NUL
 #define RVA_TF_POS           0x47f36f8   // Transform.get_position -> Vector3
 #define RVA_FINDOBJS         0x47ee9b8   // Object.FindObjectsOfType(Type) -> Object[]
 #define RVA_GET_TRANSFORM    0x47e8b58   // Component.get_transform -> Transform
+#define RVA_GET_PIXEL_WIDTH  0x47b1658   // Camera.get_pixelWidth -> int
+#define RVA_GET_PIXEL_HEIGHT 0x47b1698   // Camera.get_pixelHeight -> int
 
 #define RVA_il2cpp_domain_get            0x25797f0
 #define RVA_il2cpp_domain_assembly_open  0x25797f4
@@ -216,6 +221,8 @@ static void bind_pointers() {
     Tf_get_pos      = (Tf_get_pos_t)  (B + RVA_TF_POS);
     FindObjs        = (FindObjs_t)    (B + RVA_FINDOBJS);
     Comp_get_tf     = (Comp_get_tf_t) (B + RVA_GET_TRANSFORM);
+    Camera_get_pixelWidth  = (Cam_pixelDim_t)(B + RVA_GET_PIXEL_WIDTH);
+    Camera_get_pixelHeight = (Cam_pixelDim_t)(B + RVA_GET_PIXEL_HEIGHT);
 
     il2cpp_domain_get           = (il2cpp_domain_get_t)          (B + RVA_il2cpp_domain_get);
     il2cpp_domain_assembly_open = (il2cpp_domain_assembly_open_t)(B + RVA_il2cpp_domain_assembly_open);
@@ -515,6 +522,25 @@ static void compute_boxes() {
         if (plh) enum_plh_players(targets); else find_targets(targets);
         void* cam = Camera_get_main(NULL);
         if (cam) {
+            // Camera.WorldToScreenPoint returns coordinates in Unity's PIXEL
+            // space (Camera.pixelWidth/pixelHeight — the real render-target
+            // resolution, e.g. under Retina scaling or dynamic resolution),
+            // NOT the UIKit POINT space our MTKView reports (view.bounds).
+            // Treating them as the same space is why boxes only lined up
+            // near one screen corner and drifted everywhere else — a scale
+            // mismatch grows with distance from the origin. Rescale every
+            // projected point into UI points before using it.
+            float gameW = Camera_get_pixelWidth  ? (float)Camera_get_pixelWidth(cam, NULL)  : screenW;
+            float gameH = Camera_get_pixelHeight ? (float)Camera_get_pixelHeight(cam, NULL) : screenH;
+            if (gameW <= 0) gameW = screenW;
+            if (gameH <= 0) gameH = screenH;
+            const float sx = screenW / gameW;
+            const float sy = screenH / gameH;
+            auto toUI = [&](const Vector3& s, float& ux, float& uy) {
+                ux = s.x * sx;
+                uy = screenH - (s.y * sy);
+            };
+
             // Two entries whose world anchors land within DEDUP_DIST of each
             // other are treated as the same character (this is what produced
             // the "doubled box" — some source lists can carry two live
@@ -557,8 +583,11 @@ static void compute_boxes() {
                     Vector3 s0 = W2S(cam, p0, NULL);
                     Vector3 s1 = W2S(cam, p1, NULL);
                     if (s0.z > 0.0f && s1.z > 0.0f) {
+                        float ux0, uy0, ux1, uy1;
+                        toUI(s0, ux0, uy0);
+                        toUI(s1, ux1, uy1);
                         std::lock_guard<std::mutex> l(g_calib_mtx);
-                        g_calib = { true, s0.x, screenH - s0.y, s1.x, screenH - s1.y };
+                        g_calib = { true, ux0, uy0, ux1, uy1 };
                         calibDone = true;
                     }
                 }
@@ -568,8 +597,11 @@ static void compute_boxes() {
                 Vector3 sTop = W2S(cam, top, NULL);
                 Vector3 sBot = W2S(cam, bot, NULL);
                 if (sBot.z <= 0.0f || sTop.z <= 0.0f) continue;
-                float botY = screenH - sBot.y, topY = screenH - sTop.y;
-                float cx = (sTop.x + sBot.x) * 0.5f;
+                float uxTop, uyTop, uxBot, uyBot;
+                toUI(sTop, uxTop, uyTop);
+                toUI(sBot, uxBot, uyBot);
+                float topY = uyTop, botY = uyBot;
+                float cx = (uxTop + uxBot) * 0.5f;
                 if (cx <= 0 || cx >= screenW) continue;
                 float h = botY - topY; if (h < 6) h = 6;
                 float w = h * g_width_mult;

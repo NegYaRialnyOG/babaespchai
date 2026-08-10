@@ -935,9 +935,13 @@ static void apply_aimbot(void* controller) {
 typedef void (*ECC_SetInputs_t)(void*, void*, void*);
 static ECC_SetInputs_t Orig_ECC_SetInputs = NULL;
 static bool g_aimbot_hook_installed = false;
+static long g_hook_call_count = 0;     // proves whether the hook fires AT ALL during live play
+static void* g_hook_last_thiz = NULL;  // which controller instance is actually calling us
 
 static void Hook_ECC_SetInputs(void* thiz, void* inputs, void* method) {
     if (Orig_ECC_SetInputs) Orig_ECC_SetInputs(thiz, inputs, method);
+    g_hook_call_count++;
+    g_hook_last_thiz = thiz;
     apply_aimbot(thiz);
 }
 
@@ -1189,6 +1193,17 @@ static void render_frame(float screenW, float screenH) {
         }
     }
 
+    // Aimbot hook call counter — NOT time-limited (unlike the load banner
+    // above) since RESOLVE and aim-testing can happen well after 20s, and
+    // this is the one fact that actually answers "does SetInputs even fire
+    // during live play" without opening the menu or pasting any logs.
+    if (g_aimbot_hook_installed) {
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        char buf[96];
+        snprintf(buf, sizeof(buf), "aimbot hook calls=%ld  thiz=%p", g_hook_call_count, g_hook_last_thiz);
+        draw_outlined_text(dl, ImVec2(10, 34), IM_COL32(255,220,80,255), buf);
+    }
+
     { std::lock_guard<std::mutex> l(g_rects_mtx); g_capture_rects = rects; }
 }
 
@@ -1371,12 +1386,20 @@ static void setup_overlay() {
 
 // ---------------------------------------------------------------------------
 %ctor {
-    // Only bind pointers (safe) and raise the overlay. il2cpp resolve is NOT
-    // done here — it's a manual button in-game, so the menu always appears and
-    // a bad/early runtime call can't kill startup.
+    // Bind pointers (safe) and raise the overlay first, so the menu appears
+    // even if something below goes wrong. Resolve+hook-install used to be a
+    // manual button-press (originally to protect against an early-runtime
+    // crash risk that's since been fixed) — now auto-triggered a few seconds
+    // later on the SAME main-thread pump the button used, since forgetting to
+    // tap it was turning into its own recurring failure mode. The button
+    // still works too, for re-resolving after switching targets.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         bind_pointers();
         setup_overlay();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            g_want_resolve = true;
+        });
     });
 }

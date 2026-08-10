@@ -38,11 +38,13 @@ typedef Vector3 (*Tf_get_pos_t)(void* transform, void* method);            // Tr
 typedef void*   (*FindObjs_t)(void* type, void* method);                    // Object.FindObjectsOfType(Type)
 typedef void*   (*Comp_get_tf_t)(void* component, void* method);           // Component.get_transform
 typedef int32_t (*Cam_pixelDim_t)(void* camera, void* method);             // Camera.get_pixelWidth/Height
+typedef uint8_t (*Physics_Raycast_t)(Vector3 origin, Vector3 direction, float maxDistance, int32_t layerMask, void* method); // Physics.Raycast(...) -> bool (il2cpp bool = 1 byte)
 
 static Cam_W2S_t      W2S             = NULL;
 static Cam_get_main_t Camera_get_main = NULL;
 static Tf_get_pos_t   Tf_get_pos      = NULL;
 static FindObjs_t     FindObjs        = NULL;
+static Physics_Raycast_t Physics_Raycast = NULL;
 static Comp_get_tf_t  Comp_get_tf     = NULL;
 static Cam_pixelDim_t Camera_get_pixelWidth  = NULL;
 static Cam_pixelDim_t Camera_get_pixelHeight = NULL;
@@ -86,6 +88,7 @@ static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value    = NUL
 #define RVA_GET_TRANSFORM    0x47e8b58   // Component.get_transform -> Transform
 #define RVA_GET_PIXEL_WIDTH  0x47b1658   // Camera.get_pixelWidth -> int
 #define RVA_GET_PIXEL_HEIGHT 0x47b1698   // Camera.get_pixelHeight -> int
+#define RVA_PHYSICS_RAYCAST  0x483dac4   // Physics.Raycast(Vector3,Vector3,float,int) -> bool
 
 #define RVA_il2cpp_domain_get            0x25797f0
 #define RVA_il2cpp_domain_assembly_open  0x25797f4
@@ -200,6 +203,7 @@ static float     g_aimbot_fov_px     = 220.0f;  // max screen-space distance (UI
 static float     g_aimbot_smooth     = 0.25f;   // 0..1 lerp factor per tick toward the target direction (lower = smoother/slower)
 static float     g_aimbot_eye_off    = 1.5f;    // world units up from controller anchor to eye height
 static int       g_aimbot_bone       = BONE_CHEST; // which bone to aim at, when bones are available
+static bool      g_aimbot_wallcheck  = true;   // skip targets with no clear line of sight (Physics.Raycast)
 
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
@@ -324,6 +328,7 @@ static void bind_pointers() {
     Comp_get_tf     = (Comp_get_tf_t) (B + RVA_GET_TRANSFORM);
     Camera_get_pixelWidth  = (Cam_pixelDim_t)(B + RVA_GET_PIXEL_WIDTH);
     Camera_get_pixelHeight = (Cam_pixelDim_t)(B + RVA_GET_PIXEL_HEIGHT);
+    Physics_Raycast = (Physics_Raycast_t)(B + RVA_PHYSICS_RAYCAST);
 
     il2cpp_domain_get           = (il2cpp_domain_get_t)          (B + RVA_il2cpp_domain_get);
     il2cpp_domain_assembly_open = (il2cpp_domain_assembly_open_t)(B + RVA_il2cpp_domain_assembly_open);
@@ -858,11 +863,6 @@ static void apply_aimbot(void* controller) {
     if (!g_aimbot_on || !g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) return;
     if (!safe_ptr(controller)) return;
 
-    void* ctrlTf = Comp_get_tf(controller, NULL);
-    if (!safe_ptr(ctrlTf)) return;
-    Vector3 eye = Tf_get_pos(ctrlTf, NULL);
-    eye.y += g_aimbot_eye_off;
-
     void* cam = Camera_get_main(NULL);
     if (!cam) return;
 
@@ -877,13 +877,27 @@ static void apply_aimbot(void* controller) {
     std::vector<void*> players;
     enum_plh_players(players);
 
-    // Same auto-detected local-team logic as the ESP box filter, kept in sync
-    // manually since this runs on a separate pass over the player list.
+    // Real eye position: the LOCAL player's own head bone, not a guessed
+    // world-unit offset from the controller's transform. Aiming too high was
+    // exactly this — the controller anchor sits at the KCC capsule's own
+    // reference point (not eye height), so a flat "+1.5" fudge overshot.
+    // Fall back to the old controller-transform+offset only if the local
+    // player's bones aren't available for some reason.
+    void* localPd = NULL;
     int autoLocalTeam = -1;
     for (void* obj : players) {
-        if (*(bool*)((char*)obj + g_pd_local)) { autoLocalTeam = *(int*)((char*)obj + g_pd_team); break; }
+        if (*(bool*)((char*)obj + g_pd_local)) { localPd = obj; autoLocalTeam = *(int*)((char*)obj + g_pd_team); break; }
     }
     const int effectiveLocalTeam = (g_local_team >= 0) ? g_local_team : autoLocalTeam;
+
+    Vector3 eye;
+    bool haveRealEye = localPd && get_bone_pos(localPd, BONE_HEAD, eye);
+    if (!haveRealEye) {
+        void* ctrlTf = Comp_get_tf(controller, NULL);
+        if (!safe_ptr(ctrlTf)) return;
+        eye = Tf_get_pos(ctrlTf, NULL);
+        eye.y += g_aimbot_eye_off;
+    }
 
     void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{};
     for (void* obj : players) {
@@ -904,7 +918,22 @@ static void apply_aimbot(void* controller) {
         float dx = ux - cxScreen, dy = uy - cyScreen;
         float d2 = dx*dx + dy*dy;
         if (d2 > g_aimbot_fov_px * g_aimbot_fov_px) continue;
-        if (d2 < bestDist2) { bestDist2 = d2; best = obj; bestAimPoint = aimPoint; }
+        if (d2 >= bestDist2) continue;
+
+        if (g_aimbot_wallcheck && Physics_Raycast) {
+            Vector3 toTarget; toTarget.x = aimPoint.x - eye.x; toTarget.y = aimPoint.y - eye.y; toTarget.z = aimPoint.z - eye.z;
+            float dist = sqrtf(toTarget.x*toTarget.x + toTarget.y*toTarget.y + toTarget.z*toTarget.z);
+            if (dist > 0.01f) {
+                // Raycast just short of the target: if something solid blocks
+                // that shortened path, it's a wall (the target itself sits
+                // just beyond this range, so its own collider is excluded).
+                Vector3 rayDir{ toTarget.x/dist, toTarget.y/dist, toTarget.z/dist };
+                bool blocked = Physics_Raycast(eye, rayDir, dist * 0.92f, ~0, NULL) != 0;
+                if (blocked) continue;
+            }
+        }
+
+        bestDist2 = d2; best = obj; bestAimPoint = aimPoint;
     }
     if (!best) return;
 
@@ -1041,6 +1070,8 @@ static void render_frame(float screenW, float screenH) {
                 static const int boneVals[] = {BONE_STOMACH, BONE_LOWERCHEST, BONE_CHEST, BONE_HEAD};
                 g_aimbot_bone = boneVals[boneSel];
             }
+            ImGui::Checkbox("Wallcheck", &g_aimbot_wallcheck);
+            ImGui::SameLine(); ImGui::TextDisabled("(skip targets with no clear line of sight)");
         }
 
         if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {

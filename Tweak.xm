@@ -115,6 +115,26 @@ static void*     g_img        = NULL;   // Assembly-CSharp image
 static void*     g_type_obj   = NULL;   // cached System.Type for g_target_cls
 static bool      g_resolved   = false;  // resolve_all completed at least once
 static int       g_resolve_step = 0;    // last stage reached (for crash localization)
+static int       g_prev_step  = -999;   // step persisted from a PREVIOUS run (survives crash)
+
+// Persist the step we're ABOUT to attempt to disk, so if that call crashes the
+// app, the number survives and we read it back on the next launch. The step
+// with no matching "done" is the offending il2cpp call.
+static void write_step(int s) {
+    g_resolve_step = s;
+    @autoreleasepool {
+        NSString* p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/esp_step.txt"];
+        [[NSString stringWithFormat:@"%d", s] writeToFile:p atomically:YES
+                                                 encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+static int read_step() {
+    @autoreleasepool {
+        NSString* p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/esp_step.txt"];
+        NSString* s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+        return s ? s.intValue : -999;
+    }
+}
 
 static bool g_esp_on       = false;
 static bool g_enemies_only = false;
@@ -212,25 +232,16 @@ static bool ensure_attached() {
 // pinpoints the offending call. NEVER auto-run at load — the domain/metadata
 // may not be ready yet; call from the menu once you're in-game.
 static void resolve_all() {
-    bind_pointers();
-    if (!ensure_attached()) { g_resolve_step = -1; return; }  // could not attach
-    g_resolve_step = 1;
-    g_dom = il2cpp_domain_get();
-    g_resolve_step = 2;
-    g_asmb = g_dom ? il2cpp_domain_assembly_open(g_dom, "Assembly-CSharp") : NULL;
-    g_resolve_step = 3;
-    g_img = g_asmb ? il2cpp_assembly_get_image(g_asmb) : NULL;
-    g_resolve_step = 4;
-    g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
-
-    // resolve PLH class + static player-array field
-    g_plh_klass = NULL; g_plh_fld = NULL;
-    if (g_img && il2cpp_class_from_name && il2cpp_class_get_field_from_name) {
-        g_plh_klass = il2cpp_class_from_name(g_img, "", g_plh_cls);
-        if (g_plh_klass) g_plh_fld = il2cpp_class_get_field_from_name(g_plh_klass, g_plh_field);
-    }
-    g_resolve_step = 5;
-    g_resolved = true;
+    write_step(10); bind_pointers();
+    write_step(11); void* dom0 = il2cpp_domain_get ? il2cpp_domain_get() : NULL;  // pure getter
+    write_step(12); if (dom0 && il2cpp_thread_attach && !g_attached) { il2cpp_thread_attach(dom0); g_attached = true; }
+    write_step(13); g_dom = il2cpp_domain_get ? il2cpp_domain_get() : NULL;
+    write_step(14); g_asmb = (g_dom && il2cpp_domain_assembly_open) ? il2cpp_domain_assembly_open(g_dom, "Assembly-CSharp") : NULL;
+    write_step(15); g_img  = (g_asmb && il2cpp_assembly_get_image) ? il2cpp_assembly_get_image(g_asmb) : NULL;
+    write_step(16); g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
+    write_step(17); g_plh_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", g_plh_cls) : NULL;
+    write_step(18); g_plh_fld = (g_plh_klass && il2cpp_class_get_field_from_name) ? il2cpp_class_get_field_from_name(g_plh_klass, g_plh_field) : NULL;
+    write_step(19); g_resolved = true;
 }
 
 // Read the PLH static player array and collect element pointers (valid this
@@ -451,6 +462,8 @@ static void render_frame(float screenW, float screenH) {
         ImGui::SeparatorText("State");
         if (ImGui::Button("RESOLVE il2cpp (tap in-game)")) resolve_all();
         ImGui::Text("resolved=%d step=%d attached=%d", g_resolved ? 1 : 0, g_resolve_step, g_attached ? 1 : 0);
+        ImGui::Text("PREV RUN reached step=%d", g_prev_step);
+        ImGui::TextDisabled("(10 bind,11 domget,12 attach,13 dom,14 asm,15 img,16 type,17 PLHcls,18 fld,19 done)");
         ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
         ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
@@ -603,6 +616,7 @@ static ESPWindow*   g_window   = nil;
 static ESPRenderer* g_renderer = nil;
 
 static void setup_overlay() {
+    g_prev_step = read_step();   // what the last run reached before dying (if any)
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return;
     CGRect b = [UIScreen mainScreen].bounds;

@@ -106,7 +106,9 @@ static float     g_width_mult     = 0.45f;     // box width as fraction of its h
 // the live text inputs below instead of hardcoding forever.
 static int  g_esp_src   = 1;            // 0 = FindObjectsOfType(class), 1 = PLH players
 static char g_plh_cls[32]   = "PLH";
-static char g_plh_field[32] = "PAFMAJGGFBD";   // static KGMEKDDPPNE[] players (offset 0x10 in PLH)
+static char g_plh_field[32] = "PAFMAJGGFBD";   // auto-picked by resolve_all; this is just the last winner
+// Every field PLH could plausibly hold the player array under, tried automatically.
+static const char* g_plh_field_candidates[] = { "PAFMAJGGFBD", "AAHFKKPKJEP" };
 static uintptr_t g_pd_pos    = 0xa4;    // PlayerData.Pos    (Vector3)
 static uintptr_t g_pd_health = 0x58;    // PlayerData.health (int)
 static uintptr_t g_pd_team   = 0x40;    // PlayerData.team   (int)
@@ -114,6 +116,7 @@ static uintptr_t g_pd_local  = 0x28;    // PlayerData.localplayer (bool)
 static uintptr_t g_pd_zombie = 0x11c;   // PlayerData.zombie (bool)
 static void*     g_plh_klass = NULL;
 static void*     g_plh_fld   = NULL;    // the static field handle for the array
+static int       g_plh_field_score = -1; // how many entries in the auto-picked field looked like real players
 static float     g_pd_head_off = 1.6f;  // Pos is at feet-ish -> box top above
 static float     g_pd_feet_off = -0.1f; // small drop below Pos to feet
 
@@ -244,12 +247,56 @@ static char g_asm_name[48] = "Assembly-CSharp.dll";   // exactly like the source
 
 // Resolve exactly like the Android source: NO il2cpp_domain_get (that's what
 // hung at step 11), NO thread_attach. Just domain_assembly_open(NULL, name).
+// Score a candidate static field: read it, count entries that look like a real
+// PlayerData (safe pointer + health in a sane range + team in a sane range).
+// Returns -1 if the field itself doesn't resolve or isn't a readable array.
+static int score_plh_field(void* fld) {
+    if (!fld || !il2cpp_field_static_get_value) return -1;
+    void* arr = NULL;
+    il2cpp_field_static_get_value(fld, &arr);
+    if (!safe_ptr(arr)) return -1;
+    int cnt = *(int*)((char*)arr + 0x18);
+    if (cnt < 0 || cnt > 256) return -1;
+    int good = 0;
+    for (int i = 0; i < cnt; i++) {
+        void* o = *(void**)((char*)arr + 0x20 + (uintptr_t)i * 8);
+        if (!safe_ptr(o)) continue;
+        int hp = *(int*)((char*)o + g_pd_health);
+        int tm = *(int*)((char*)o + g_pd_team);
+        if (hp >= -1 && hp <= 1000 && tm >= -1 && tm <= 16) good++;
+    }
+    return good;
+}
+
+// Resolve exactly like the Android source: NO il2cpp_domain_get (that hung),
+// NO thread_attach. Then AUTO-PICK whichever candidate PLH field actually
+// holds sane player data — no manual retyping needed when the game updates
+// and obfuscated names shuffle. Only falls back to hand-editing the field
+// name in the menu if every candidate scores 0 (rare: a brand new field
+// layout, not just a renamed one).
 static void resolve_all() {
     write_step(10); bind_pointers();
     write_step(11); g_asmb = il2cpp_domain_assembly_open ? il2cpp_domain_assembly_open(NULL, g_asm_name) : NULL;
     write_step(12); g_img  = (g_asmb && il2cpp_assembly_get_image) ? il2cpp_assembly_get_image(g_asmb) : NULL;
     write_step(13); g_plh_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", g_plh_cls) : NULL;
-    write_step(14); g_plh_fld = (g_plh_klass && il2cpp_class_get_field_from_name) ? il2cpp_class_get_field_from_name(g_plh_klass, g_plh_field) : NULL;
+
+    write_step(14);
+    void* best_fld = NULL; int best_score = -1; const char* best_name = NULL;
+    if (g_plh_klass && il2cpp_class_get_field_from_name) {
+        for (const char* cand : g_plh_field_candidates) {
+            void* fld = il2cpp_class_get_field_from_name(g_plh_klass, cand);
+            int sc = score_plh_field(fld);
+            if (sc > best_score) { best_score = sc; best_fld = fld; best_name = cand; }
+        }
+        // last-resort: the name currently in the (possibly hand-edited) text box
+        void* fld = il2cpp_class_get_field_from_name(g_plh_klass, g_plh_field);
+        int sc = score_plh_field(fld);
+        if (sc > best_score) { best_score = sc; best_fld = fld; best_name = g_plh_field; }
+    }
+    g_plh_fld = best_fld;
+    if (best_name && best_name != g_plh_field) { strncpy(g_plh_field, best_name, sizeof(g_plh_field)-1); g_plh_field[sizeof(g_plh_field)-1]=0; }
+    g_plh_field_score = best_score;
+
     write_step(15); g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
     write_step(16); g_dom = NULL; g_resolved = true;
 }
@@ -559,7 +606,7 @@ static void render_frame(float screenW, float screenH) {
         ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
         ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
-        ImGui::Text("PLH klass=%p fld=%p", g_plh_klass, g_plh_fld);
+        ImGui::Text("PLH klass=%p fld=%p (auto: %s, score=%d)", g_plh_klass, g_plh_fld, g_plh_field, g_plh_field_score);
         ImGui::Text("PLH players now=%d  boxes=%d", g_plh_count, (int)g_boxes.size());
 
         if (ImGui::CollapsingHeader("PlayerData offsets")) {

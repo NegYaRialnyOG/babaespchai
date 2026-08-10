@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <cmath>
+#include <substrate.h>
 
 #include "imgui.h"
 #include "imgui_impl_metal.h"
@@ -426,8 +427,10 @@ static bool get_base_pos(void* pd, Vector3& outPos) {
 // and obfuscated names shuffle. Only falls back to hand-editing the field
 // name in the menu if every candidate scores 0 (rare: a brand new field
 // layout, not just a renamed one).
+static void install_aimbot_hook();  // defined below; forward-declared for use here
 static void resolve_all() {
     write_step(10); bind_pointers();
+    install_aimbot_hook();
     write_step(11); g_asmb = il2cpp_domain_assembly_open ? il2cpp_domain_assembly_open(NULL, g_asm_name) : NULL;
     write_step(12); g_img  = (g_asmb && il2cpp_assembly_get_image) ? il2cpp_assembly_get_image(g_asmb) : NULL;
     write_step(13); g_plh_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", g_plh_cls) : NULL;
@@ -836,20 +839,24 @@ static void compute_boxes() {
 }
 
 // The main-thread pump: does all il2cpp/game work off the render thread.
-// Visual aimbot: no hooking, just a field write into the local player's own
+// Visual aimbot: writes into the local player's own
 // ExampleCharacterController.lookInputVector — the same field the game's own
 // touch-drag code writes every frame, so the camera visibly turns exactly
 // like a real drag would. Target = nearest-to-screen-center living enemy
 // within g_aimbot_fov_px, aimed at a real bone when available (else the flat
 // Pos field), eased in by g_aimbot_smooth so it doesn't snap instantly.
-static void run_aimbot() {
+//
+// MUST run from inside the SetInputs hook below, not an async timer: a plain
+// periodic field write got silently overwritten every frame by the game's
+// own input processing before ever being consumed (confirmed empirically —
+// it only had a visible, one-off effect once, right as the player died and
+// normal input processing paused). Calling this from the hook, AFTER
+// forwarding to the real SetInputs, guarantees our write lands in the exact
+// frame window between "game finished its own input processing" and
+// "controller consumes lookInputVector for rotation" — every single frame.
+static void apply_aimbot(void* controller) {
     if (!g_aimbot_on || !g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) return;
-    if (!g_ecc_type_obj) return;
-
-    std::vector<void*> controllers;
-    enum_type(g_ecc_type_obj, controllers);
-    if (controllers.empty()) return;
-    void* controller = controllers[0];   // only the local player runs this controller
+    if (!safe_ptr(controller)) return;
 
     void* ctrlTf = Comp_get_tf(controller, NULL);
     if (!safe_ptr(ctrlTf)) return;
@@ -914,6 +921,33 @@ static void run_aimbot() {
     cur->z += (dir.z - cur->z) * t;
 }
 
+// ---------------------------------------------------------------------------
+// SetInputs hook. Unambiguous target (unlike send_pos's 5 signature-identical
+// candidates): this exact overload keeps its real name AND matches the
+// source's own hook point, because it's a public contract method of the
+// open-source KinematicCharacterController asset that couldn't be safely
+// renamed. We never touch the `inputs` struct itself (its field layout in
+// this build is unknown/unverified) — just call straight through to the
+// original first (zero risk of corrupting whatever the game passed in), then
+// apply our own override directly to the controller instance, whose layout
+// (lookInputVector @ 0xFC) we've already confirmed byte-for-byte.
+#define RVA_ECC_SETINPUTS 0x2d8f68c
+typedef void (*ECC_SetInputs_t)(void*, void*, void*);
+static ECC_SetInputs_t Orig_ECC_SetInputs = NULL;
+static bool g_aimbot_hook_installed = false;
+
+static void Hook_ECC_SetInputs(void* thiz, void* inputs, void* method) {
+    if (Orig_ECC_SetInputs) Orig_ECC_SetInputs(thiz, inputs, method);
+    apply_aimbot(thiz);
+}
+
+static void install_aimbot_hook() {
+    if (g_aimbot_hook_installed || !g_image_base) return;
+    void* target = (void*)(g_image_base + RVA_ECC_SETINPUTS);
+    MSHookFunction(target, (void*)Hook_ECC_SetInputs, (void**)&Orig_ECC_SetInputs);
+    g_aimbot_hook_installed = true;
+}
+
 static void main_pump() {
     if (g_want_resolve) { g_want_resolve = false; resolve_all(); }
     if (g_want_replh) {
@@ -931,7 +965,9 @@ static void main_pump() {
     }
     if (g_resolved) { std::vector<void*> v; g_plh_count = enum_plh_players(v); }
     if (g_esp_on && g_resolved) compute_boxes();
-    if (g_aimbot_on && g_resolved) run_aimbot();
+    // Aimbot itself now runs from inside the SetInputs hook (installed once
+    // in resolve_all), not here — see apply_aimbot's comment for why a plain
+    // periodic write from this timer never survived to be used.
 }
 
 // Menu visibility, toggled by a 3-finger double-tap anywhere on screen (see
@@ -1037,7 +1073,7 @@ static void render_frame(float screenW, float screenH) {
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
         ImGui::Text("PLH klass=%p fld=%p (auto: %s, score=%d)", g_plh_klass, g_plh_fld, g_plh_field, g_plh_field_score);
         ImGui::Text("PLH players now=%d  boxes=%d", g_plh_count, (int)g_boxes.size());
-        ImGui::Text("aimbot controller type_obj=%p", g_ecc_type_obj);
+        ImGui::Text("aimbot controller type_obj=%p hook_installed=%d", g_ecc_type_obj, g_aimbot_hook_installed);
         {
             std::lock_guard<std::mutex> l(g_calib_mtx);
             if (g_calib.valid)

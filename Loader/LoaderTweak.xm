@@ -15,6 +15,7 @@
 // something's not working so the failure point is visible instead of guessed.
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <string>

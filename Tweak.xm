@@ -23,9 +23,10 @@
 // Bump this every release — shown in the always-on load indicator so it's
 // obvious whether the loader actually replaced the running dylib with the
 // latest one, vs a stale cached copy.
-#define BUILD_TAG "diag1"
+#define BUILD_TAG "diag2"
 
 static double g_overlay_start_time = 0;
+static bool   g_gesture_host_found = false;
 
 struct Vector3 { float x, y, z; };
 
@@ -1004,10 +1005,11 @@ static void render_frame(float screenW, float screenH) {
     // not a stale cached one the loader failed to replace.
     if (g_overlay_start_time > 0) {
         double elapsed = [NSDate timeIntervalSinceReferenceDate] - g_overlay_start_time;
-        if (elapsed < 15.0) {
+        if (elapsed < 20.0) {
             ImDrawList* dl = ImGui::GetForegroundDrawList();
-            char buf[96];
-            snprintf(buf, sizeof(buf), "Blockpost ESP loaded [%s] — 3-finger double-tap for menu", BUILD_TAG);
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Blockpost ESP loaded [%s] gesture-host=%s — 3-finger double-tap for menu",
+                     BUILD_TAG, g_gesture_host_found ? "game-view" : "FALLBACK(own view, may not work)");
             draw_outlined_text(dl, ImVec2(10, 10), IM_COL32(120,255,120,255), buf);
         }
     }
@@ -1071,15 +1073,6 @@ static void render_frame(float screenW, float screenH) {
 @end
 @implementation ESPWindow
 - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
-    // Always let a genuine 3-finger touch reach OUR window (and therefore our
-    // gesture recognizer below), regardless of the menu's capture rects — this
-    // is how the menu gets opened in the first place when it's hidden. Relying
-    // on finding "the game's own window" via the deprecated, sometimes-nil
-    // UIApplication.keyWindow was fragile (confirmed broken on this build);
-    // intercepting inside our OWN window sidesteps that entirely. A stray
-    // 3-finger touch during normal one/two-thumb play essentially never
-    // happens, so this doesn't interfere with gameplay.
-    if (event.allTouches.count >= 3) return [super hitTest:point withEvent:event];
     std::lock_guard<std::mutex> l(g_rects_mtx);
     for (const CGRect& r : g_capture_rects)
         if (CGRectContainsPoint(r, point)) return [super hitTest:point withEvent:event];
@@ -1087,10 +1080,17 @@ static void render_frame(float screenW, float screenH) {
 }
 @end
 
-// 3-finger double-tap toggles the menu. The recognizer lives on OUR OWN view
-// (ESPView, below) — ESPWindow.hitTest above carves out an exception so
-// 3-finger touches always reach it even while the menu is closed and
-// everything else passes through to the game untouched.
+// 3-finger double-tap toggles the menu. MUST be attached to the GAME's own
+// view, not ours: UIKit's hitTest is evaluated PER TOUCH at the moment that
+// touch begins, not once for the whole gesture. With 3 fingers landing a few
+// milliseconds apart (never truly simultaneous), the first 1-2 touches get
+// hit-tested — and committed to whichever view claims them — before the 3rd
+// one even exists, so a "let 3+ finger events through to our own window"
+// hitTest override only ever sees the LAST finger, never all three at once,
+// and the recognizer can never satisfy numberOfTouchesRequired=3. That was
+// the actual bug in the previous attempt at this. The game's own window
+// naturally receives every touch already (it's what the user is touching),
+// so attaching there sidesteps the whole per-touch hit-testing problem.
 @interface ESPGestureTarget : NSObject
 - (void)onTripleTap:(UITapGestureRecognizer*)g;
 @end
@@ -1099,12 +1099,37 @@ static void render_frame(float screenW, float screenH) {
 @end
 static ESPGestureTarget* g_gestureTarget = nil;
 
+// Robust discovery of the game's own root view: UIApplication.keyWindow is
+// deprecated and returned nil in exactly this app (confirmed via diagnostic
+// logging), so try the modern per-scene API first, then fall back through
+// keyWindow, then just the first window with a root VC.
+static UIView* find_game_root_view() {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene* scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene* ws = (UIWindowScene*)scene;
+            for (UIWindow* w in ws.windows) {
+                if (w.isKeyWindow && w.rootViewController) return w.rootViewController.view;
+            }
+        }
+    }
+    UIWindow* kw = [UIApplication sharedApplication].keyWindow;
+    if (kw.rootViewController) return kw.rootViewController.view;
+    for (UIWindow* w in [UIApplication sharedApplication].windows) {
+        if (w.rootViewController) return w.rootViewController.view;
+    }
+    return nil;
+}
+
 static ESPWindow*   g_window   = nil;
 static ESPRenderer* g_renderer = nil;
 
 static void setup_overlay() {
     g_overlay_start_time = [NSDate timeIntervalSinceReferenceDate];
     g_prev_step = read_step();   // what the last run reached before dying (if any)
+    // Grab the GAME's real root view BEFORE creating our own overlay window
+    // below (which becomes key-and-visible and would otherwise shadow it).
+    UIView* gameRootView = find_game_root_view();
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return;
@@ -1145,8 +1170,11 @@ static void setup_overlay() {
     mtk.delegate = g_renderer;
     [g_window makeKeyAndVisible];
 
-    // Attached to OUR OWN view — ESPWindow.hitTest carves out the exception
-    // that lets 3-finger touches reach it regardless of the menu's open state.
+    // Attached to the GAME's own view (found above, before our window stole
+    // key-window status) so every finger of the 3-finger tap is naturally
+    // hit-tested there together — see find_game_root_view's comment for why
+    // this can't live on our own overlay window instead. cancelsTouchesInView
+    // = NO keeps normal 1-2 finger gameplay completely unaffected.
     g_gestureTarget = [ESPGestureTarget new];
     UITapGestureRecognizer* tap = [[UITapGestureRecognizer alloc]
         initWithTarget:g_gestureTarget action:@selector(onTripleTap:)];
@@ -1154,7 +1182,10 @@ static void setup_overlay() {
     tap.numberOfTapsRequired = 2;
     tap.cancelsTouchesInView = NO;
     tap.delaysTouchesBegan = NO;
-    [mtk addGestureRecognizer:tap];
+    UIView* gestureHost = gameRootView ?: mtk;
+    g_gesture_host_found = (gameRootView != nil);
+    [gestureHost addGestureRecognizer:tap];
+    NSLog(@"[BlockpostESP] gesture host = %@ (gameRootView=%@)", gestureHost, gameRootView);
 
     // Main-thread pump: ALL il2cpp/game reads happen here, never on the render
     // thread. Matched to the render thread's 60fps so boxes update every

@@ -1,19 +1,15 @@
 // Blockpost Mobile 2D Box ESP — NeqYaRialnyOG & Nyx
-// Overlay Dear ImGui menu + il2cpp runtime enumeration of all characters.
+// Overlay Dear ImGui menu on our own MTKView (no Metal hook, no MSHookFunction).
 //
-// Rendering is on our OWN MTKView above the game (no hooking Unity's Metal or
-// MSHookFunction -> safe on arm64e). We read game state through the exported
-// il2cpp_* API and by calling a few resolved Unity methods directly.
-//
-// Resolved for BLOCKPOSTMOBILE build 260206 (metadata v31, arm64), image
-// = UnityFramework. All addresses are RVAs relative to that image's header
-// and are live-editable from the debug menu.
+// Enemies are enumerated with UnityEngine.Object.FindObjectsOfType(Type) so we
+// don't depend on any single game-specific list (KCC motors only ever held the
+// local player). Everything is resolved by RVA against UnityFramework and is
+// live-tunable from the debug menu. Resolved for BLOCKPOSTMOBILE build 260206.
 
 #import <UIKit/UIKit.h>
 #import <MetalKit/MetalKit.h>
 #import <Metal/Metal.h>
 #include <mach-o/dyld.h>
-#include <dlfcn.h>
 #include <string.h>
 #include <vector>
 #include <mutex>
@@ -22,220 +18,220 @@
 #include "imgui.h"
 #include "imgui_impl_metal.h"
 
-// ---------------------------------------------------------------------------
-// Unity math
-// ---------------------------------------------------------------------------
 struct Vector3 { float x, y, z; };
-struct Vector2 { float x, y; };
 
-// il2cpp methods take a trailing hidden `const MethodInfo* method` argument.
-// Camera.WorldToScreenPoint(Vector3): instance method, returns Vector3 by value
-// (x,y in pixels from bottom-left, z = depth). No out-ptr, no eye arg -> nothing
-// to misalign. (The _Injected variant crashed because it needs (ref,eye,out).)
-typedef Vector3 (*W2S_t)(void* camera, Vector3 pos, void* method);
-typedef void* (*Camera_get_main_t)(void* method);
-typedef Vector3 (*Motor_get_TransientPosition_t)(void* motor, void* method);
+// Resolved Unity methods (called by address; trailing arg = hidden MethodInfo*)
+typedef Vector3 (*Cam_W2S_t)(void* camera, Vector3 pos, void* method);      // Camera.WorldToScreenPoint(Vector3)
+typedef void*   (*Cam_get_main_t)(void* method);                            // Camera.get_main
+typedef Vector3 (*Tf_get_pos_t)(void* transform, void* method);            // Transform.get_position
+typedef void*   (*FindObjs_t)(void* type, void* method);                    // Object.FindObjectsOfType(Type)
 
-static W2S_t                          W2S            = NULL;
-static Camera_get_main_t              Camera_get_main= NULL;
-static Motor_get_TransientPosition_t  Motor_get_TP   = NULL;
+static Cam_W2S_t      W2S             = NULL;
+static Cam_get_main_t Camera_get_main = NULL;
+static Tf_get_pos_t   Tf_get_pos      = NULL;
+static FindObjs_t     FindObjs        = NULL;
 
-// ---------------------------------------------------------------------------
-// il2cpp runtime API (exported by UnityFramework, resolved via dlsym)
-// ---------------------------------------------------------------------------
+// il2cpp runtime API (bound by RVA — these aren't in the export trie)
 typedef void* (*il2cpp_domain_get_t)();
 typedef void* (*il2cpp_domain_assembly_open_t)(void*, const char*);
 typedef void* (*il2cpp_assembly_get_image_t)(void*);
 typedef void* (*il2cpp_class_from_name_t)(void*, const char*, const char*);
-typedef void* (*il2cpp_class_get_field_from_name_t)(void*, const char*);
-typedef void  (*il2cpp_field_static_get_value_t)(void*, void*);
+typedef void* (*il2cpp_class_get_type_t)(void*);
+typedef void* (*il2cpp_type_get_object_t)(void*);
 typedef void* (*il2cpp_object_get_class_t)(void*);
 typedef const char* (*il2cpp_class_get_name_t)(void*);
-typedef void* (*il2cpp_thread_attach_t)(void*);
 
-static il2cpp_domain_get_t                il2cpp_domain_get               = NULL;
-static il2cpp_domain_assembly_open_t      il2cpp_domain_assembly_open     = NULL;
-static il2cpp_assembly_get_image_t        il2cpp_assembly_get_image       = NULL;
-static il2cpp_class_from_name_t           il2cpp_class_from_name          = NULL;
-static il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name= NULL;
-static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value   = NULL;
-static il2cpp_object_get_class_t          il2cpp_object_get_class         = NULL;
-static il2cpp_class_get_name_t            il2cpp_class_get_name           = NULL;
-static il2cpp_thread_attach_t             il2cpp_thread_attach            = NULL;
+static il2cpp_domain_get_t           il2cpp_domain_get           = NULL;
+static il2cpp_domain_assembly_open_t il2cpp_domain_assembly_open = NULL;
+static il2cpp_assembly_get_image_t   il2cpp_assembly_get_image   = NULL;
+static il2cpp_class_from_name_t      il2cpp_class_from_name      = NULL;
+static il2cpp_class_get_type_t       il2cpp_class_get_type       = NULL;
+static il2cpp_type_get_object_t      il2cpp_type_get_object      = NULL;
+static il2cpp_object_get_class_t     il2cpp_object_get_class     = NULL;
+static il2cpp_class_get_name_t       il2cpp_class_get_name       = NULL;
 
-// il2cpp API RVAs pulled from the UnityFramework symbol table (build 260206).
-// dlsym can't see these (not in the export trie), so we call them by address.
+// RVAs (UnityFramework, build 260206) --------------------------------------
+#define RVA_W2S              0x321c108   // Camera.WorldToScreenPoint(Vector3) -> Vector3
+#define RVA_GET_MAIN         0x321c3d4   // Camera.get_main
+#define RVA_TF_POS           0x325da48   // Transform.get_position -> Vector3
+#define RVA_FINDOBJS         0x3258d94   // Object.FindObjectsOfType(Type) -> Object[]
+
 #define RVA_il2cpp_domain_get            0x10afe4c
 #define RVA_il2cpp_domain_assembly_open  0x10afe50
 #define RVA_il2cpp_assembly_get_image    0x10af938
 #define RVA_il2cpp_class_from_name       0x10af96c
-#define RVA_il2cpp_class_get_field       0x10af98c
-#define RVA_il2cpp_field_static_get      0x10b0088
+#define RVA_il2cpp_class_get_type        0x10af9d4
+#define RVA_il2cpp_type_get_object       0x10b0368
 #define RVA_il2cpp_object_get_class      0x10b027c
 #define RVA_il2cpp_class_get_name        0x10af998
-#define RVA_il2cpp_thread_attach         0x10b030c
 
-// ---------------------------------------------------------------------------
-// Live-tunable offsets / RVAs (all relative to g_image_base)
-// ---------------------------------------------------------------------------
-static char      g_image_name[64]   = "UnityFramework";
-static uintptr_t g_rva_w2s          = 0x321c108; // Camera.WorldToScreenPoint(Vector3) by value
-static uintptr_t g_rva_getmain      = 0x321c3d4; // Camera.get_main
-static uintptr_t g_rva_tp           = 0x17c93b8; // KinematicCharacterMotor.get_TransientPosition
-static uintptr_t g_off_ctrl         = 0x1B0;     // motor -> CharacterController (ICharacterController)
-static uintptr_t g_off_team         = 0x0;       // team int inside the controller object (TUNE ME)
-static float     g_box_height       = 1.8f;      // world units, feet->head
+// Live-tunable target -------------------------------------------------------
+static char      g_image_name[64] = "UnityFramework";
+static char      g_target_ns[64]  = "";       // BotAI has no namespace
+static char      g_target_cls[64] = "BotAI";  // what to draw boxes on
+static uintptr_t g_off_tf         = 0x20;     // Transform field inside target (BotAI._meshesRoot)
+static uintptr_t g_off_team       = 0x28;     // team int inside target (BotAI, guess)
+static float     g_box_height     = 1.8f;
 
-static uintptr_t g_image_base       = 0;
-static bool      g_esp_on           = false;     // OFF until reads are validated
-static bool      g_enemies_only     = false;     // needs a valid g_off_team first
-static int       g_local_team       = -1;
+static uintptr_t g_image_base = 0;
+static void*     g_img        = NULL;   // Assembly-CSharp image
+static void*     g_type_obj   = NULL;   // cached System.Type for g_target_cls
 
-// Per-capability debug gates. Start with only pure-memory reads enabled; the
-// method-call paths (which can crash if an ABI/addr is wrong) are opt-in so we
-// can bisect the crash on-device without nuking the app every frame.
-static bool      g_dbg_names        = false;     // il2cpp_object_get_class + get_name
-static bool      g_dbg_pos          = false;     // Motor.get_TransientPosition
-static bool      g_dbg_w2s          = false;     // Camera.WorldToScreenPoint
-static int       g_scan_count       = -1;        // cached last scan result
+static bool g_esp_on       = false;
+static bool g_enemies_only = false;
+static int  g_local_team   = -1;
 
-// il2cpp handles (resolved once, refreshed on Apply)
-static void* g_kcs_class = NULL;   // KinematicCharacterSystem
-static void* g_motors_field = NULL;// static List<KinematicCharacterMotor> CharacterMotors
+static bool g_dbg_names = false;
+static bool g_dbg_pos   = false;
+static bool g_dbg_w2s   = false;
+static int  g_scan_count = -1;
 
 static std::string g_debug_text;
 
 // ---------------------------------------------------------------------------
-static uintptr_t image_header_for(const char* needle) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char* n = _dyld_get_image_name(i);
-        if (n && needle && strstr(n, needle))
-            return (uintptr_t)_dyld_get_image_header(i);
-    }
-    return 0;
-}
-
-// Bind the il2cpp API by address (dlsym fails: symbols aren't in the export trie).
-static void resolve_il2cpp_api(uintptr_t base) {
-    #define BIND(fn) fn = (fn##_t)(base + RVA_##fn)
-    BIND(il2cpp_domain_get);
-    BIND(il2cpp_domain_assembly_open);
-    BIND(il2cpp_assembly_get_image);
-    BIND(il2cpp_class_from_name);
-    il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t)(base + RVA_il2cpp_class_get_field);
-    il2cpp_field_static_get_value    = (il2cpp_field_static_get_value_t)   (base + RVA_il2cpp_field_static_get);
-    il2cpp_object_get_class          = (il2cpp_object_get_class_t)         (base + RVA_il2cpp_object_get_class);
-    il2cpp_class_get_name            = (il2cpp_class_get_name_t)           (base + RVA_il2cpp_class_get_name);
-    il2cpp_thread_attach             = (il2cpp_thread_attach_t)            (base + RVA_il2cpp_thread_attach);
-    #undef BIND
-}
-
-static void resolve_all() {
-    g_image_base = image_header_for(g_image_name);
-    if (!g_image_base) g_image_base = (uintptr_t)_dyld_get_image_header(0);
-
-    resolve_il2cpp_api(g_image_base);
-
-    W2S             = g_rva_w2s     ? (W2S_t)(g_image_base + g_rva_w2s)                        : NULL;
-    Camera_get_main = g_rva_getmain ? (Camera_get_main_t)(g_image_base + g_rva_getmain)         : NULL;
-    Motor_get_TP    = g_rva_tp      ? (Motor_get_TransientPosition_t)(g_image_base + g_rva_tp)  : NULL;
-
-    // resolve the static motor list via runtime API
-    g_kcs_class = NULL; g_motors_field = NULL;
-    if (il2cpp_domain_get && il2cpp_class_from_name) {
-        void* dom = il2cpp_domain_get();
-        void* asmb = il2cpp_domain_assembly_open ? il2cpp_domain_assembly_open(dom, "Assembly-CSharp") : NULL;
-        void* img = asmb && il2cpp_assembly_get_image ? il2cpp_assembly_get_image(asmb) : NULL;
-        if (img) {
-            g_kcs_class = il2cpp_class_from_name(img, "KinematicCharacterController", "KinematicCharacterSystem");
-            if (g_kcs_class && il2cpp_class_get_field_from_name)
-                g_motors_field = il2cpp_class_get_field_from_name(g_kcs_class, "CharacterMotors");
-        }
-    }
-}
-
-// Sanity gate for any pointer we're about to dereference into game memory.
 static inline bool safe_ptr(const void* p) {
     uintptr_t v = (uintptr_t)p;
     return v > 0x10000 && (v & 0x7) == 0 && v < 0x0000100000000000ULL;
 }
 
-// Snapshot the current motor list into a plain vector of pointers.
-static int get_motors(std::vector<void*>& out) {
+static uintptr_t image_header_for(const char* needle) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char* n = _dyld_get_image_name(i);
+        if (n && needle && strstr(n, needle)) return (uintptr_t)_dyld_get_image_header(i);
+    }
+    return 0;
+}
+
+static void* type_object_for(const char* ns, const char* name) {
+    if (!g_img || !il2cpp_class_from_name || !il2cpp_class_get_type || !il2cpp_type_get_object) return NULL;
+    void* k = il2cpp_class_from_name(g_img, ns, name);
+    if (!k) return NULL;
+    void* t = il2cpp_class_get_type(k);
+    if (!t) return NULL;
+    return il2cpp_type_get_object(t);
+}
+
+static void resolve_all() {
+    g_image_base = image_header_for(g_image_name);
+    if (!g_image_base) g_image_base = (uintptr_t)_dyld_get_image_header(0);
+    uintptr_t B = g_image_base;
+
+    W2S             = (Cam_W2S_t)     (B + RVA_W2S);
+    Camera_get_main = (Cam_get_main_t)(B + RVA_GET_MAIN);
+    Tf_get_pos      = (Tf_get_pos_t)  (B + RVA_TF_POS);
+    FindObjs        = (FindObjs_t)    (B + RVA_FINDOBJS);
+
+    il2cpp_domain_get           = (il2cpp_domain_get_t)          (B + RVA_il2cpp_domain_get);
+    il2cpp_domain_assembly_open = (il2cpp_domain_assembly_open_t)(B + RVA_il2cpp_domain_assembly_open);
+    il2cpp_assembly_get_image   = (il2cpp_assembly_get_image_t)  (B + RVA_il2cpp_assembly_get_image);
+    il2cpp_class_from_name      = (il2cpp_class_from_name_t)     (B + RVA_il2cpp_class_from_name);
+    il2cpp_class_get_type       = (il2cpp_class_get_type_t)      (B + RVA_il2cpp_class_get_type);
+    il2cpp_type_get_object      = (il2cpp_type_get_object_t)     (B + RVA_il2cpp_type_get_object);
+    il2cpp_object_get_class     = (il2cpp_object_get_class_t)    (B + RVA_il2cpp_object_get_class);
+    il2cpp_class_get_name       = (il2cpp_class_get_name_t)      (B + RVA_il2cpp_class_get_name);
+
+    void* dom = il2cpp_domain_get();
+    void* asmb = dom ? il2cpp_domain_assembly_open(dom, "Assembly-CSharp") : NULL;
+    g_img = asmb ? il2cpp_assembly_get_image(asmb) : NULL;
+    g_type_obj = type_object_for(g_target_ns, g_target_cls);
+}
+
+// Enumerate live instances of the target class. Object[] layout: count @0x18,
+// element pointers begin @0x20.
+static int find_targets(std::vector<void*>& out) {
     out.clear();
-    if (!g_motors_field || !il2cpp_field_static_get_value) return 0;
-    void* listobj = NULL;
-    il2cpp_field_static_get_value(g_motors_field, &listobj); // static -> obj ignored
-    if (!safe_ptr(listobj)) return 0;
-    // System.Collections.Generic.List<T>: _items @0x10 (T[]), _size @0x18 (int)
-    void* items = *(void**)((char*)listobj + 0x10);
-    int size    = *(int*) ((char*)listobj + 0x18);
-    if (!safe_ptr(items) || size <= 0 || size > 512) return 0;
-    // Il2CppArray payload begins at 0x20
-    for (int i = 0; i < size; i++) {
-        void* m = *(void**)((char*)items + 0x20 + (uintptr_t)i * 8);
-        if (safe_ptr(m)) out.push_back(m);
+    if (!FindObjs || !g_type_obj) return 0;
+    void* arr = FindObjs(g_type_obj, NULL);
+    if (!safe_ptr(arr)) return 0;
+    int cnt = *(int*)((char*)arr + 0x18);
+    if (cnt <= 0 || cnt > 1024) return 0;
+    for (int i = 0; i < cnt; i++) {
+        void* o = *(void**)((char*)arr + 0x20 + (uintptr_t)i * 8);
+        if (safe_ptr(o)) out.push_back(o);
     }
     return (int)out.size();
 }
 
-static int motor_team(void* motor) {
-    if (!g_off_team || !safe_ptr(motor)) return -999;
-    void* ctrl = *(void**)((char*)motor + g_off_ctrl);
-    if (!safe_ptr(ctrl)) return -999;
-    return *(int*)((char*)ctrl + g_off_team);
+static bool obj_pos(void* o, Vector3& outp) {
+    if (!safe_ptr(o) || !Tf_get_pos) return false;
+    void* tf = *(void**)((char*)o + g_off_tf);
+    if (!safe_ptr(tf)) return false;
+    outp = Tf_get_pos(tf, NULL);
+    return true;
+}
+
+static int obj_team(void* o) {
+    if (!g_off_team || !safe_ptr(o)) return -999;
+    return *(int*)((char*)o + g_off_team);
+}
+
+// probe a class name and return instance count (or negative error)
+static int probe_count(const char* ns, const char* name, void** first) {
+    void* t = type_object_for(ns, name);
+    if (!t || !FindObjs) return -1;
+    void* arr = FindObjs(t, NULL);
+    if (!safe_ptr(arr)) return -2;
+    int c = *(int*)((char*)arr + 0x18);
+    if (c < 0 || c > 4096) return -3;
+    if (first && c > 0) *first = *(void**)((char*)arr + 0x20);
+    return c;
 }
 
 // ---------------------------------------------------------------------------
 static std::string build_debug_dump() {
-    char b[512];
-    std::string o;
+    char b[512]; std::string o;
     snprintf(b, sizeof(b), "=== Blockpost ESP debug ===\nimage=%s base=0x%lx\n"
-             "rva_w2s=0x%lx rva_getmain=0x%lx rva_tp=0x%lx off_ctrl=0x%lx off_team=0x%lx\n",
+             "target=%s.%s off_tf=0x%lx off_team=0x%lx\n",
              g_image_name, (unsigned long)g_image_base,
-             (unsigned long)g_rva_w2s, (unsigned long)g_rva_getmain, (unsigned long)g_rva_tp,
-             (unsigned long)g_off_ctrl, (unsigned long)g_off_team);
+             g_target_ns, g_target_cls, (unsigned long)g_off_tf, (unsigned long)g_off_team);
     o += b;
-    snprintf(b, sizeof(b), "il2cpp api: dom=%p class=%p field=%p\n",
-             (void*)il2cpp_domain_get, g_kcs_class, g_motors_field); o += b;
+    snprintf(b, sizeof(b), "img=%p type_obj=%p cam=%p\n",
+             g_img, g_type_obj, Camera_get_main ? Camera_get_main(NULL) : NULL); o += b;
+
+    // probe likely classes so we see which one actually has instances
+    struct { const char* ns; const char* n; } cand[] = {
+        {"", "BotAI"}, {"", "Player"},
+        {"KinematicCharacterController.Examples", "ExampleCharacterController"},
+        {"KinematicCharacterController", "KinematicCharacterMotor"},
+    };
+    o += "-- class population --\n";
+    for (auto& c : cand) {
+        void* first = NULL;
+        int n = probe_count(c.ns, c.n, &first);
+        snprintf(b, sizeof(b), "   %-28s count=%d first=%p\n", c.n, n, first); o += b;
+    }
 
     void* cam = Camera_get_main ? Camera_get_main(NULL) : NULL;
-    snprintf(b, sizeof(b), "camera=%p\n", cam); o += b;
+    std::vector<void*> t; int n = find_targets(t);
+    snprintf(b, sizeof(b), "-- target '%s' instances=%d --\n", g_target_cls, n); o += b;
 
-    std::vector<void*> motors; int n = get_motors(motors);
-    snprintf(b, sizeof(b), "motors=%d\n", n); o += b;
-
-    // dump up to 4 characters: controller class name + first 0x80 bytes so we
-    // can locate the team field, plus position + screen projection.
-    // Each capability is gated separately so a bad one can be turned off.
     for (int i = 0; i < n && i < 4; i++) {
-        void* m = motors[i];
-        if (!safe_ptr(m)) continue;
-        void* ctrl = *(void**)((char*)m + g_off_ctrl);
+        void* obj = t[i];
         const char* cname = "?";
-        if (g_dbg_names && safe_ptr(ctrl) && il2cpp_object_get_class && il2cpp_class_get_name) {
-            void* c = il2cpp_object_get_class(ctrl);
+        if (g_dbg_names && il2cpp_object_get_class && il2cpp_class_get_name) {
+            void* c = il2cpp_object_get_class(obj);
             if (safe_ptr(c)) cname = il2cpp_class_get_name(c);
         }
-        snprintf(b, sizeof(b), "-- motor[%d]=%p ctrl=%p (%s) --\n", i, m, ctrl, cname); o += b;
+        snprintf(b, sizeof(b), "obj[%d]=%p (%s)\n", i, obj, cname); o += b;
 
-        if (g_dbg_pos && Motor_get_TP) {
-            Vector3 p = Motor_get_TP(m, NULL);
-            snprintf(b, sizeof(b), "   pos=(%.2f,%.2f,%.2f)", p.x, p.y, p.z); o += b;
-            if (g_dbg_w2s && cam && W2S) {
-                Vector3 s = W2S(cam, p, NULL);
-                snprintf(b, sizeof(b), "  screen=(%.1f,%.1f,z=%.2f)", s.x, s.y, s.z); o += b;
+        if (g_dbg_pos) {
+            Vector3 p;
+            if (obj_pos(obj, p)) {
+                snprintf(b, sizeof(b), "   pos=(%.2f,%.2f,%.2f)", p.x, p.y, p.z); o += b;
+                if (g_dbg_w2s && cam && W2S) {
+                    Vector3 s = W2S(cam, p, NULL);
+                    snprintf(b, sizeof(b), "  screen=(%.1f,%.1f,z=%.2f)", s.x, s.y, s.z); o += b;
+                }
+                o += "\n";
             }
-            o += "\n";
         }
-        if (safe_ptr(ctrl)) {
-            unsigned char* bytes = (unsigned char*)ctrl;
-            for (int row = 0; row < 0x80; row += 16) {
+        if (safe_ptr(obj)) {
+            unsigned char* by = (unsigned char*)obj;
+            for (int row = 0; row < 0x60; row += 16) {
                 snprintf(b, sizeof(b), "   +0x%02x: ", row); o += b;
-                for (int c = 0; c < 16; c++) { snprintf(b, sizeof(b), "%02x ", bytes[row+c]); o += b; }
-                snprintf(b, sizeof(b), " i0=%d f0=%.2f\n",
-                         *(int*)(bytes+row), *(float*)(bytes+row)); o += b;
+                for (int c = 0; c < 16; c++) { snprintf(b, sizeof(b), "%02x ", by[row+c]); o += b; }
+                snprintf(b, sizeof(b), " i=%d f=%.2f\n", *(int*)(by+row), *(float*)(by+row)); o += b;
             }
         }
     }
@@ -243,12 +239,13 @@ static std::string build_debug_dump() {
 }
 
 // ---------------------------------------------------------------------------
-// Touch capture rects
-// ---------------------------------------------------------------------------
 static std::mutex          g_rects_mtx;
 static std::vector<CGRect> g_capture_rects;
 
-// ---------------------------------------------------------------------------
+// cached enumeration for ESP (refreshed at low rate)
+static std::vector<void*> g_cache;
+static int                g_cache_frame = 0;
+
 static void render_frame(float screenW, float screenH) {
     std::vector<CGRect> rects;
 
@@ -265,34 +262,27 @@ static void render_frame(float screenW, float screenH) {
         ImGui::InputInt("Local team", &g_local_team);
         ImGui::SliderFloat("Box height", &g_box_height, 0.5f, 3.0f);
 
-        if (ImGui::CollapsingHeader("Offsets (advanced)")) {
+        if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {
             ImGui::InputText("image", g_image_name, sizeof(g_image_name));
-            ImGui::InputScalar("W2S",     ImGuiDataType_U64, &g_rva_w2s,     0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            ImGui::InputScalar("get_main",ImGuiDataType_U64, &g_rva_getmain, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            ImGui::InputScalar("TransPos",ImGuiDataType_U64, &g_rva_tp,      0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            ImGui::InputScalar("ctrl off",ImGuiDataType_U64, &g_off_ctrl,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            ImGui::InputScalar("team off",ImGuiDataType_U64, &g_off_team,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputText("namespace", g_target_ns, sizeof(g_target_ns));
+            ImGui::InputText("class", g_target_cls, sizeof(g_target_cls));
+            ImGui::InputScalar("tf off",   ImGuiDataType_U64, &g_off_tf,   0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputScalar("team off", ImGuiDataType_U64, &g_off_team, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
             if (ImGui::Button("Apply / Re-resolve")) resolve_all();
         }
 
         ImGui::SeparatorText("State");
-        ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
-        ImGui::Text("class=%p field=%p", g_kcs_class, g_motors_field);
-        ImGui::Text("last scan motors=%d", g_scan_count);
+        ImGui::Text("base=0x%lx img=%p", (unsigned long)g_image_base, g_img);
+        ImGui::Text("type_obj=%p  last scan=%d", g_type_obj, g_scan_count);
 
         ImGui::SeparatorText("Self-test (enable one at a time)");
-        ImGui::TextDisabled("if a step crashes, that call is the culprit");
-        // pure-memory scan: no method calls, safe
-        if (ImGui::Button("1. Scan list")) {
-            std::vector<void*> mv; g_scan_count = get_motors(mv);
-        }
-        // opt-in method-call gates
-        ImGui::Checkbox("2. class names (il2cpp)", &g_dbg_names);
-        ImGui::Checkbox("3. positions (get_TransientPosition)", &g_dbg_pos);
-        ImGui::Checkbox("4. project (WorldToScreenPoint)", &g_dbg_w2s);
+        if (ImGui::Button("1. Scan")) { std::vector<void*> v; g_scan_count = find_targets(v); }
+        ImGui::Checkbox("2. class names", &g_dbg_names);
+        ImGui::Checkbox("3. positions", &g_dbg_pos);
+        ImGui::Checkbox("4. project (W2S)", &g_dbg_w2s);
 
         if (ImGui::Button("Copy Debug")) {
-            g_debug_text = build_debug_dump();   // built only on demand
+            g_debug_text = build_debug_dump();
             [UIPasteboard generalPasteboard].string =
                 [NSString stringWithUTF8String:g_debug_text.c_str()];
         }
@@ -300,32 +290,29 @@ static void render_frame(float screenW, float screenH) {
     }
     ImGui::End();
 
-    // ---- ESP boxes ----
-    if (g_esp_on && W2S && Camera_get_main && Motor_get_TP) {
+    if (g_esp_on && W2S && Camera_get_main && Tf_get_pos && g_type_obj) {
+        if (++g_cache_frame % 15 == 0 || g_cache.empty()) find_targets(g_cache);
         void* cam = Camera_get_main(NULL);
         if (cam) {
-            std::vector<void*> motors; get_motors(motors);
             ImDrawList* dl = ImGui::GetForegroundDrawList();
-            for (void* m : motors) {
+            for (void* obj : g_cache) {
                 if (g_enemies_only && g_off_team && g_local_team >= 0) {
-                    int t = motor_team(m);
-                    if (t == g_local_team) continue;
+                    int tm = obj_team(obj);
+                    if (tm == g_local_team) continue;
                 }
-                Vector3 feet = Motor_get_TP(m, NULL);
+                Vector3 feet;
+                if (!obj_pos(obj, feet)) continue;
                 Vector3 head = feet; head.y += g_box_height;
-
                 Vector3 sf = W2S(cam, feet, NULL);
                 Vector3 sh = W2S(cam, head, NULL);
-                if (sf.z <= 0.0f) continue; // behind camera
-
-                float feetY = screenH - sf.y;   // Unity origin bottom-left -> UIKit top-left
+                if (sf.z <= 0.0f) continue;             // behind camera
+                float feetY = screenH - sf.y;           // Unity bottom-left -> UIKit top-left
                 float headY = screenH - sh.y;
                 float cx = sf.x;
                 if (cx <= 0 || cx >= screenW) continue;
-
                 float h = feetY - headY; if (h < 6) h = 6;
                 float w = h * 0.45f;
-                ImVec2 tl(cx - w * 0.5f, headY), br(cx + w * 0.5f, feetY);
+                ImVec2 tl(cx - w*0.5f, headY), br(cx + w*0.5f, feetY);
                 dl->AddRect(ImVec2(tl.x-1,tl.y-1), ImVec2(br.x+1,br.y+1), IM_COL32(0,0,0,180), 0,0,3.0f);
                 dl->AddRect(tl, br, IM_COL32(255,40,40,255), 0,0,1.5f);
             }
@@ -378,7 +365,6 @@ static void render_frame(float screenW, float screenH) {
 }
 @end
 
-// Orientation-locked host: Blockpost runs landscape; stop the overlay flipping.
 @interface ESPVC : UIViewController
 @end
 @implementation ESPVC
@@ -405,8 +391,6 @@ static ESPRenderer* g_renderer = nil;
 static void setup_overlay() {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return;
-    // force landscape geometry (wider than tall) so we never inherit a
-    // portrait frame if the app briefly reports one during launch
     CGRect b = [UIScreen mainScreen].bounds;
     CGRect frame = (b.size.width < b.size.height)
                  ? CGRectMake(0, 0, b.size.height, b.size.width) : b;
@@ -446,7 +430,6 @@ static void setup_overlay() {
 
 // ---------------------------------------------------------------------------
 %ctor {
-    // give il2cpp + the app UI time to come up before we resolve/overlay
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         resolve_all();

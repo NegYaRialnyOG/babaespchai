@@ -61,25 +61,29 @@ static il2cpp_thread_current_t       il2cpp_thread_current       = NULL;
 static il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name = NULL;
 static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value    = NULL;
 
-// RVAs (UnityFramework, build 260206) --------------------------------------
-#define RVA_W2S              0x321c108   // Camera.WorldToScreenPoint(Vector3) -> Vector3
-#define RVA_GET_MAIN         0x321c3d4   // Camera.get_main
-#define RVA_TF_POS           0x325da48   // Transform.get_position -> Vector3
-#define RVA_FINDOBJS         0x3258d94   // Object.FindObjectsOfType(Type) -> Object[]
-#define RVA_GET_TRANSFORM    0x3252f14   // Component.get_transform -> Transform
+// RVAs (UnityFramework, build 260720) --------------------------------------
+// Re-derived after the game updated past 260206 (which caused the domain_get
+// hang / domain_assembly_open crash — those RVAs pointed into the WRONG,
+// stale binary). Verified two ways: (1) Mach-O symbol table for il2cpp_*
+// exports, (2) fresh Il2CppDumper run against the 260720 UnityFramework+metadata.
+#define RVA_W2S              0x47b1be4   // Camera.WorldToScreenPoint(Vector3) -> Vector3
+#define RVA_GET_MAIN         0x47b1eb0   // Camera.get_main
+#define RVA_TF_POS           0x47f36f8   // Transform.get_position -> Vector3
+#define RVA_FINDOBJS         0x47ee9b8   // Object.FindObjectsOfType(Type) -> Object[]
+#define RVA_GET_TRANSFORM    0x47e8b58   // Component.get_transform -> Transform
 
-#define RVA_il2cpp_domain_get            0x10afe4c
-#define RVA_il2cpp_domain_assembly_open  0x10afe50
-#define RVA_il2cpp_assembly_get_image    0x10af938
-#define RVA_il2cpp_class_from_name       0x10af96c
-#define RVA_il2cpp_class_get_type        0x10af9d4
-#define RVA_il2cpp_type_get_object       0x10b0368
-#define RVA_il2cpp_object_get_class      0x10b027c
-#define RVA_il2cpp_class_get_name        0x10af998
-#define RVA_il2cpp_thread_attach         0x10b030c
-#define RVA_il2cpp_thread_current        0x10b0308
-#define RVA_il2cpp_class_get_field_from_name 0x10af98c
-#define RVA_il2cpp_field_static_get_value    0x10b0088
+#define RVA_il2cpp_domain_get            0x25797f0
+#define RVA_il2cpp_domain_assembly_open  0x25797f4
+#define RVA_il2cpp_assembly_get_image    0x25792dc
+#define RVA_il2cpp_class_from_name       0x2579310
+#define RVA_il2cpp_class_get_type        0x2579378
+#define RVA_il2cpp_type_get_object       0x2579d0c
+#define RVA_il2cpp_object_get_class      0x2579c20
+#define RVA_il2cpp_class_get_name        0x257933c
+#define RVA_il2cpp_thread_attach         0x2579cb0
+#define RVA_il2cpp_thread_current        0x2579cac
+#define RVA_il2cpp_class_get_field_from_name 0x2579330
+#define RVA_il2cpp_field_static_get_value    0x2579a2c
 
 // Live-tunable target -------------------------------------------------------
 static char      g_image_name[64] = "UnityFramework";
@@ -94,15 +98,20 @@ static float     g_width_mult     = 0.45f;     // box width as fraction of its h
 
 // --- Blockpost-native player source (class PLH holds a static player array) --
 // Cross-referenced from the Android source (PlayerData layout) against the BPM
-// 260206 dump: PLH.PAODCKAEMPJ is a static DCEFKHDNOFM[] of all players.
+// 260720 dump. Build 260720 inserted one extra string field at 0x20 vs 260206,
+// shifting every field after it by +8; also PLH now exposes TWO static arrays
+// (0x10 and 0x18) instead of one — 0x10 is the one in the same slot the old
+// single-array build used, so that's the default. Class/field names are
+// obfuscated per-build and WILL change again on the next game update — hence
+// the live text inputs below instead of hardcoding forever.
 static int  g_esp_src   = 1;            // 0 = FindObjectsOfType(class), 1 = PLH players
 static char g_plh_cls[32]   = "PLH";
-static char g_plh_field[32] = "PAODCKAEMPJ";   // static DCEFKHDNOFM[] players
-static uintptr_t g_pd_pos    = 0x9c;    // DCEFKHDNOFM.Pos    (Vector3)
-static uintptr_t g_pd_health = 0x50;    // DCEFKHDNOFM.health (int)
-static uintptr_t g_pd_team   = 0x38;    // DCEFKHDNOFM.team   (int)
-static uintptr_t g_pd_local  = 0x20;    // DCEFKHDNOFM.localplayer (bool)
-static uintptr_t g_pd_zombie = 0x114;   // DCEFKHDNOFM.zombie (bool)
+static char g_plh_field[32] = "PAFMAJGGFBD";   // static KGMEKDDPPNE[] players (offset 0x10 in PLH)
+static uintptr_t g_pd_pos    = 0xa4;    // PlayerData.Pos    (Vector3)
+static uintptr_t g_pd_health = 0x58;    // PlayerData.health (int)
+static uintptr_t g_pd_team   = 0x40;    // PlayerData.team   (int)
+static uintptr_t g_pd_local  = 0x28;    // PlayerData.localplayer (bool)
+static uintptr_t g_pd_zombie = 0x11c;   // PlayerData.zombie (bool)
 static void*     g_plh_klass = NULL;
 static void*     g_plh_fld   = NULL;    // the static field handle for the array
 static float     g_pd_head_off = 1.6f;  // Pos is at feet-ish -> box top above
@@ -420,6 +429,7 @@ static std::mutex        g_boxes_mtx;
 static std::vector<Box>  g_boxes;
 static bool              g_want_resolve = false;   // button -> main thread does resolve_all
 static bool              g_want_debug   = false;   // button -> main thread builds debug dump
+static bool              g_want_replh   = false;   // button -> main thread re-resolves PLH class/field
 static float             g_scrW = 0, g_scrH = 0;   // last display size from render thread
 static int               g_plh_count = 0;          // players seen by last main pump
 
@@ -475,6 +485,13 @@ static void compute_boxes() {
 // The main-thread pump: does all il2cpp/game work off the render thread.
 static void main_pump() {
     if (g_want_resolve) { g_want_resolve = false; resolve_all(); }
+    if (g_want_replh) {
+        g_want_replh = false;
+        if (g_img && il2cpp_class_from_name && il2cpp_class_get_field_from_name) {
+            g_plh_klass = il2cpp_class_from_name(g_img, "", g_plh_cls);
+            g_plh_fld = g_plh_klass ? il2cpp_class_get_field_from_name(g_plh_klass, g_plh_field) : NULL;
+        }
+    }
     if (g_want_debug) {
         g_want_debug = false;
         g_debug_text = build_debug_dump();
@@ -546,10 +563,13 @@ static void render_frame(float screenW, float screenH) {
         ImGui::Text("PLH players now=%d  boxes=%d", g_plh_count, (int)g_boxes.size());
 
         if (ImGui::CollapsingHeader("PlayerData offsets")) {
+            ImGui::InputText("PLH class", g_plh_cls, sizeof(g_plh_cls));
+            ImGui::InputText("PLH field (array)", g_plh_field, sizeof(g_plh_field));
             ImGui::InputScalar("Pos",    ImGuiDataType_U64, &g_pd_pos,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
             ImGui::InputScalar("health", ImGuiDataType_U64, &g_pd_health, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
             ImGui::InputScalar("team",   ImGuiDataType_U64, &g_pd_team,   0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
             ImGui::InputScalar("local",  ImGuiDataType_U64, &g_pd_local,  0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            if (ImGui::Button("Re-resolve PLH field")) g_want_replh = true;  // main-thread pump does the actual call
         }
 
         ImGui::SeparatorText("Self-test / offset explorer");

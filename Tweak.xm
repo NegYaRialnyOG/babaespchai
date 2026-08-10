@@ -24,7 +24,7 @@
 // Bump this every release — shown in the always-on load indicator so it's
 // obvious whether the loader actually replaced the running dylib with the
 // latest one, vs a stale cached copy.
-#define BUILD_TAG "diag2"
+#define BUILD_TAG "aimhook1"
 
 static double g_overlay_start_time = 0;
 static bool   g_gesture_host_found = false;
@@ -1025,9 +1025,9 @@ static void render_frame(float screenW, float screenH) {
             ImGui::Checkbox("Armor bar", &g_show_armor_bar); ImGui::SameLine();
             ImGui::Checkbox("Weapon name", &g_show_weapon);
 
-            ImGui::SeparatorText("Aimbot (visual — no hooking)");
+            ImGui::SeparatorText("Aimbot (visual — SetInputs hook)");
             ImGui::Checkbox("Aimbot", &g_aimbot_on);
-            ImGui::SameLine(); ImGui::TextDisabled("(writes lookInputVector, camera visibly turns)");
+            ImGui::SameLine(); ImGui::TextDisabled("(hooks SetInputs, writes lookInputVector every frame)");
             ImGui::SliderFloat("FOV (px)", &g_aimbot_fov_px, 20.0f, 600.0f);
             ImGui::SliderFloat("Smoothness", &g_aimbot_smooth, 0.02f, 1.0f);
             ImGui::SameLine(); ImGui::TextDisabled("(low=slow/smooth, 1=instant snap)");

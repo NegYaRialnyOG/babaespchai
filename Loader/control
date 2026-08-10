@@ -1,0 +1,11 @@
+Package: com.neqyarialnyog.babaespchai.loader
+Name: Blockpost ESP Loader
+Depends: mobilesubstrate
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: Fetches and loads the latest Blockpost ESP release automatically
+Maintainer: NeqYaRialnyOG & Nyx
+Author: NeqYaRialnyOG & Nyx
+Section: Tweaks
+Conflicts: com.neqyarialnyog.babaespchai
+Replaces: com.neqyarialnyog.babaespchai

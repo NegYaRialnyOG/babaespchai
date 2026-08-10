@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>com.skullcapstudios.bpm</string>
+			<string>com.skullcapstudios.bps</string>
+			<string>com.skullcapstudios.blockpost</string>
+			<string>com.skullcapstudios.blockpostmobile</string>
+			<string>com.skullcapstudios.blockpostmobileios</string>
+		</array>
+	</dict>
+</dict>
+</plist>

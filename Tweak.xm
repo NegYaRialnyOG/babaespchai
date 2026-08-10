@@ -204,6 +204,8 @@ static float     g_aimbot_smooth     = 0.25f;   // 0..1 lerp factor per tick tow
 static float     g_aimbot_eye_off    = 1.5f;    // world units up from controller anchor to eye height
 static int       g_aimbot_bone       = BONE_CHEST; // which bone to aim at, when bones are available
 static bool      g_aimbot_wallcheck  = true;   // skip targets with no clear line of sight (Physics.Raycast)
+static int       g_raycast_floor_test = -1;    // -1=not run, 0=no hit, 1=hit — sanity check the Raycast binding itself
+static int       g_raycast_targets_blocked = 0; // how many candidates the wallcheck rejected, last tick
 
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
@@ -899,6 +901,17 @@ static void apply_aimbot(void* controller) {
         eye.y += g_aimbot_eye_off;
     }
 
+    // Self-test: raycast straight down 50 units. The floor is almost always
+    // there, so this answers "does the Physics.Raycast binding even work at
+    // all" independent of any doubt about wall geometry specifically.
+    if (Physics_Raycast) {
+        Vector3 down{0.0f, -1.0f, 0.0f};
+        g_raycast_floor_test = (Physics_Raycast(eye, down, 50.0f, ~0, NULL) != 0) ? 1 : 0;
+    } else {
+        g_raycast_floor_test = -1;
+    }
+    int blockedCount = 0;
+
     void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{};
     for (void* obj : players) {
         if (*(bool*)((char*)obj + g_pd_local)) continue;
@@ -929,12 +942,13 @@ static void apply_aimbot(void* controller) {
                 // just beyond this range, so its own collider is excluded).
                 Vector3 rayDir{ toTarget.x/dist, toTarget.y/dist, toTarget.z/dist };
                 bool blocked = Physics_Raycast(eye, rayDir, dist * 0.92f, ~0, NULL) != 0;
-                if (blocked) continue;
+                if (blocked) { blockedCount++; continue; }
             }
         }
 
         bestDist2 = d2; best = obj; bestAimPoint = aimPoint;
     }
+    g_raycast_targets_blocked = blockedCount;
     if (!best) return;
 
     Vector3 dir;
@@ -1230,9 +1244,12 @@ static void render_frame(float screenW, float screenH) {
     // during live play" without opening the menu or pasting any logs.
     if (g_aimbot_hook_installed) {
         ImDrawList* dl = ImGui::GetForegroundDrawList();
-        char buf[96];
+        char buf[128];
         snprintf(buf, sizeof(buf), "aimbot hook calls=%ld  thiz=%p", g_hook_call_count, g_hook_last_thiz);
         draw_outlined_text(dl, ImVec2(10, 34), IM_COL32(255,220,80,255), buf);
+        snprintf(buf, sizeof(buf), "raycast floor_test=%d (1=working)  blocked_last_tick=%d",
+                 g_raycast_floor_test, g_raycast_targets_blocked);
+        draw_outlined_text(dl, ImVec2(10, 58), IM_COL32(255,180,80,255), buf);
     }
 
     { std::lock_guard<std::mutex> l(g_rects_mtx); g_capture_rects = rects; }

@@ -231,17 +231,18 @@ __attribute__((unused)) static bool ensure_attached() {
 // Stepwise il2cpp resolve. g_resolve_step records how far we got so a crash
 // pinpoints the offending call. NEVER auto-run at load — the domain/metadata
 // may not be ready yet; call from the menu once you're in-game.
+static char g_asm_name[48] = "Assembly-CSharp.dll";   // exactly like the source
+
+// Resolve exactly like the Android source: NO il2cpp_domain_get (that's what
+// hung at step 11), NO thread_attach. Just domain_assembly_open(NULL, name).
 static void resolve_all() {
     write_step(10); bind_pointers();
-    write_step(11); void* dom0 = il2cpp_domain_get ? il2cpp_domain_get() : NULL;  // pure getter
-    write_step(12); if (dom0 && il2cpp_thread_attach && !g_attached) { il2cpp_thread_attach(dom0); g_attached = true; }
-    write_step(13); g_dom = il2cpp_domain_get ? il2cpp_domain_get() : NULL;
-    write_step(14); g_asmb = (g_dom && il2cpp_domain_assembly_open) ? il2cpp_domain_assembly_open(g_dom, "Assembly-CSharp") : NULL;
-    write_step(15); g_img  = (g_asmb && il2cpp_assembly_get_image) ? il2cpp_assembly_get_image(g_asmb) : NULL;
-    write_step(16); g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
-    write_step(17); g_plh_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", g_plh_cls) : NULL;
-    write_step(18); g_plh_fld = (g_plh_klass && il2cpp_class_get_field_from_name) ? il2cpp_class_get_field_from_name(g_plh_klass, g_plh_field) : NULL;
-    write_step(19); g_resolved = true;
+    write_step(11); g_asmb = il2cpp_domain_assembly_open ? il2cpp_domain_assembly_open(NULL, g_asm_name) : NULL;
+    write_step(12); g_img  = (g_asmb && il2cpp_assembly_get_image) ? il2cpp_assembly_get_image(g_asmb) : NULL;
+    write_step(13); g_plh_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", g_plh_cls) : NULL;
+    write_step(14); g_plh_fld = (g_plh_klass && il2cpp_class_get_field_from_name) ? il2cpp_class_get_field_from_name(g_plh_klass, g_plh_field) : NULL;
+    write_step(15); g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
+    write_step(16); g_dom = NULL; g_resolved = true;
 }
 
 // Read the PLH static player array and collect element pointers (valid this
@@ -536,7 +537,8 @@ static void render_frame(float screenW, float screenH) {
         if (ImGui::Button("RESOLVE il2cpp (tap in-game)")) g_want_resolve = true;
         ImGui::Text("resolved=%d step=%d attached=%d", g_resolved ? 1 : 0, g_resolve_step, g_attached ? 1 : 0);
         ImGui::Text("PREV RUN reached step=%d", g_prev_step);
-        ImGui::TextDisabled("(10 bind,11 domget,12 attach,13 dom,14 asm,15 img,16 type,17 PLHcls,18 fld,19 done)");
+        ImGui::TextDisabled("(10 bind,11 asm_open,12 img,13 PLHcls,14 fld,15 type,16 done)");
+        ImGui::InputText("assembly", g_asm_name, sizeof(g_asm_name));
         ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
         ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);

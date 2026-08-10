@@ -45,6 +45,8 @@ typedef void* (*il2cpp_object_get_class_t)(void*);
 typedef const char* (*il2cpp_class_get_name_t)(void*);
 typedef void* (*il2cpp_thread_attach_t)(void*);   // attach current thread to a domain
 typedef void* (*il2cpp_thread_current_t)();        // NULL if thread not attached
+typedef void* (*il2cpp_class_get_field_from_name_t)(void*, const char*);
+typedef void  (*il2cpp_field_static_get_value_t)(void*, void*);
 
 static il2cpp_domain_get_t           il2cpp_domain_get           = NULL;
 static il2cpp_domain_assembly_open_t il2cpp_domain_assembly_open = NULL;
@@ -56,6 +58,8 @@ static il2cpp_object_get_class_t     il2cpp_object_get_class     = NULL;
 static il2cpp_class_get_name_t       il2cpp_class_get_name       = NULL;
 static il2cpp_thread_attach_t        il2cpp_thread_attach        = NULL;
 static il2cpp_thread_current_t       il2cpp_thread_current       = NULL;
+static il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name = NULL;
+static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value    = NULL;
 
 // RVAs (UnityFramework, build 260206) --------------------------------------
 #define RVA_W2S              0x321c108   // Camera.WorldToScreenPoint(Vector3) -> Vector3
@@ -74,6 +78,8 @@ static il2cpp_thread_current_t       il2cpp_thread_current       = NULL;
 #define RVA_il2cpp_class_get_name        0x10af998
 #define RVA_il2cpp_thread_attach         0x10b030c
 #define RVA_il2cpp_thread_current        0x10b0308
+#define RVA_il2cpp_class_get_field_from_name 0x10af98c
+#define RVA_il2cpp_field_static_get_value    0x10b0088
 
 // Live-tunable target -------------------------------------------------------
 static char      g_image_name[64] = "UnityFramework";
@@ -85,6 +91,22 @@ static int       g_pos_mode       = 0;         // 0 = field @g_off_tf, 1 = Compo
 static float     g_head_off       = 0.2f;      // world units from anchor up to box TOP
 static float     g_feet_off       = -1.9f;     // world units from anchor down to box BOTTOM
 static float     g_width_mult     = 0.45f;     // box width as fraction of its height
+
+// --- Blockpost-native player source (class PLH holds a static player array) --
+// Cross-referenced from the Android source (PlayerData layout) against the BPM
+// 260206 dump: PLH.PAODCKAEMPJ is a static DCEFKHDNOFM[] of all players.
+static int  g_esp_src   = 1;            // 0 = FindObjectsOfType(class), 1 = PLH players
+static char g_plh_cls[32]   = "PLH";
+static char g_plh_field[32] = "PAODCKAEMPJ";   // static DCEFKHDNOFM[] players
+static uintptr_t g_pd_pos    = 0x9c;    // DCEFKHDNOFM.Pos    (Vector3)
+static uintptr_t g_pd_health = 0x50;    // DCEFKHDNOFM.health (int)
+static uintptr_t g_pd_team   = 0x38;    // DCEFKHDNOFM.team   (int)
+static uintptr_t g_pd_local  = 0x20;    // DCEFKHDNOFM.localplayer (bool)
+static uintptr_t g_pd_zombie = 0x114;   // DCEFKHDNOFM.zombie (bool)
+static void*     g_plh_klass = NULL;
+static void*     g_plh_fld   = NULL;    // the static field handle for the array
+static float     g_pd_head_off = 1.6f;  // Pos is at feet-ish -> box top above
+static float     g_pd_feet_off = -0.1f; // small drop below Pos to feet
 
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
@@ -167,6 +189,8 @@ static void bind_pointers() {
     il2cpp_class_get_name       = (il2cpp_class_get_name_t)      (B + RVA_il2cpp_class_get_name);
     il2cpp_thread_attach        = (il2cpp_thread_attach_t)       (B + RVA_il2cpp_thread_attach);
     il2cpp_thread_current       = (il2cpp_thread_current_t)      (B + RVA_il2cpp_thread_current);
+    il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t)(B + RVA_il2cpp_class_get_field_from_name);
+    il2cpp_field_static_get_value    = (il2cpp_field_static_get_value_t)   (B + RVA_il2cpp_field_static_get_value);
 }
 
 // Ensure the CURRENT thread (MTKView render thread) is attached to the il2cpp
@@ -198,8 +222,32 @@ static void resolve_all() {
     g_img = g_asmb ? il2cpp_assembly_get_image(g_asmb) : NULL;
     g_resolve_step = 4;
     g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
+
+    // resolve PLH class + static player-array field
+    g_plh_klass = NULL; g_plh_fld = NULL;
+    if (g_img && il2cpp_class_from_name && il2cpp_class_get_field_from_name) {
+        g_plh_klass = il2cpp_class_from_name(g_img, "", g_plh_cls);
+        if (g_plh_klass) g_plh_fld = il2cpp_class_get_field_from_name(g_plh_klass, g_plh_field);
+    }
     g_resolve_step = 5;
     g_resolved = true;
+}
+
+// Read the PLH static player array and collect element pointers (valid this
+// frame only). Unity managed array: length @0x18, elements @0x20 (8B ptrs).
+static int enum_plh_players(std::vector<void*>& out) {
+    out.clear();
+    if (!g_plh_fld || !il2cpp_field_static_get_value) return 0;
+    void* arr = NULL;
+    il2cpp_field_static_get_value(g_plh_fld, &arr);
+    if (!safe_ptr(arr)) return 0;
+    int cnt = *(int*)((char*)arr + 0x18);
+    if (cnt <= 0 || cnt > 1024) return 0;
+    for (int i = 0; i < cnt; i++) {
+        void* o = *(void**)((char*)arr + 0x20 + (uintptr_t)i * 8);
+        if (safe_ptr(o)) out.push_back(o);
+    }
+    return (int)out.size();
 }
 
 // Enumerate live instances of a Type object. Object[] layout: count @0x18,
@@ -303,6 +351,26 @@ static std::string build_debug_dump() {
     }
 
     void* cam = Camera_get_main ? Camera_get_main(NULL) : NULL;
+
+    // PLH native players
+    snprintf(b, sizeof(b), "-- PLH klass=%p fld=%p --\n", g_plh_klass, g_plh_fld); o += b;
+    std::vector<void*> pl; int pn = enum_plh_players(pl);
+    snprintf(b, sizeof(b), "PLH players=%d\n", pn); o += b;
+    for (int i = 0; i < pn && i < 6; i++) {
+        void* pd = pl[i];
+        int   id  = *(int*)((char*)pd + 0x10);
+        bool  loc = *(bool*)((char*)pd + g_pd_local);
+        int   tm  = *(int*)((char*)pd + g_pd_team);
+        int   hp  = *(int*)((char*)pd + g_pd_health);
+        Vector3 p = *(Vector3*)((char*)pd + g_pd_pos);
+        snprintf(b, sizeof(b), " P[%d]=%p id=%d local=%d team=%d hp=%d pos=(%.1f,%.1f,%.1f)",
+                 i, pd, id, loc, tm, hp, p.x, p.y, p.z); o += b;
+        if (cam && W2S) { Vector3 s = W2S(cam, p, NULL);
+            snprintf(b, sizeof(b), " scr=(%.0f,%.0f,z=%.1f)", s.x, s.y, s.z); o += b; }
+        o += "\n";
+        if (i == 0) o += scan_object(pd);
+    }
+
     std::vector<void*> t; int n = find_targets(t);
     snprintf(b, sizeof(b), "-- target '%s' instances=%d --\n", g_target_cls, n); o += b;
 
@@ -345,9 +413,16 @@ static void render_frame(float screenW, float screenH) {
 
         ImGui::Checkbox("ESP", &g_esp_on); ImGui::SameLine();
         ImGui::Checkbox("Enemies only", &g_enemies_only);
+        ImGui::RadioButton("PLH players (real)", &g_esp_src, 1); ImGui::SameLine();
+        ImGui::RadioButton("FindObjectsOfType", &g_esp_src, 0);
         ImGui::InputInt("Local team", &g_local_team);
-        ImGui::SliderFloat("Box top",   &g_head_off, -3.0f, 3.0f);
-        ImGui::SliderFloat("Box bottom",&g_feet_off, -3.0f, 3.0f);
+        if (g_esp_src == 1) {
+            ImGui::SliderFloat("Box top",   &g_pd_head_off, -1.0f, 3.0f);
+            ImGui::SliderFloat("Box bottom",&g_pd_feet_off, -3.0f, 1.0f);
+        } else {
+            ImGui::SliderFloat("Box top",   &g_head_off, -3.0f, 3.0f);
+            ImGui::SliderFloat("Box bottom",&g_feet_off, -3.0f, 3.0f);
+        }
         ImGui::SliderFloat("Box width", &g_width_mult, 0.1f, 1.0f);
 
         if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {
@@ -379,7 +454,19 @@ static void render_frame(float screenW, float screenH) {
         ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
         ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
+        ImGui::Text("PLH klass=%p fld=%p", g_plh_klass, g_plh_fld);
+        if (g_resolved) {
+            std::vector<void*> v; int pc = enum_plh_players(v);
+            ImGui::Text("PLH players now=%d", pc);
+        }
         ImGui::Text("last scan=%d", g_scan_count);
+
+        if (ImGui::CollapsingHeader("PlayerData offsets")) {
+            ImGui::InputScalar("Pos",    ImGuiDataType_U64, &g_pd_pos,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputScalar("health", ImGuiDataType_U64, &g_pd_health, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputScalar("team",   ImGuiDataType_U64, &g_pd_team,   0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputScalar("local",  ImGuiDataType_U64, &g_pd_local,  0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        }
 
         ImGui::SeparatorText("Self-test / offset explorer");
         if (ImGui::Button("1. Scan count")) { std::vector<void*> v; g_scan_count = find_targets(v); }
@@ -398,21 +485,38 @@ static void render_frame(float screenW, float screenH) {
 
     // ESP: enumerate FRESH this frame and use immediately (no stale cache).
     // Gated behind g_resolved so we never touch the runtime before it's ready.
-    if (g_esp_on && g_resolved && ensure_attached() && W2S && Camera_get_main && Tf_get_pos && g_type_obj) {
+    if (g_esp_on && g_resolved && ensure_attached() && W2S && Camera_get_main) {
         std::vector<void*> targets;
-        find_targets(targets);
+        bool plh = (g_esp_src == 1);
+        if (plh) enum_plh_players(targets);
+        else     find_targets(targets);
         void* cam = Camera_get_main(NULL);
         if (cam) {
             ImDrawList* dl = ImGui::GetForegroundDrawList();
             for (void* obj : targets) {
-                if (g_enemies_only && g_off_team && g_local_team >= 0) {
-                    int tm = obj_team(obj);
-                    if (tm == g_local_team) continue;
+                Vector3 anchor; float headoff, feetoff;
+                if (plh) {
+                    // real players: direct fields, no Transform needed
+                    if (*(bool*)((char*)obj + g_pd_local)) continue;      // skip self
+                    int hp = *(int*)((char*)obj + g_pd_health);
+                    if (hp <= 0) continue;                                 // dead/respawning
+                    if (g_enemies_only && g_local_team >= 0) {
+                        int tm = *(int*)((char*)obj + g_pd_team);
+                        if (tm == g_local_team) continue;
+                    }
+                    anchor = *(Vector3*)((char*)obj + g_pd_pos);
+                    headoff = g_pd_head_off; feetoff = g_pd_feet_off;
+                } else {
+                    if (!Tf_get_pos || !g_type_obj) continue;
+                    if (g_enemies_only && g_off_team && g_local_team >= 0) {
+                        int tm = obj_team(obj);
+                        if (tm == g_local_team) continue;
+                    }
+                    if (!obj_pos(obj, anchor)) continue;
+                    headoff = g_head_off; feetoff = g_feet_off;
                 }
-                Vector3 anchor;
-                if (!obj_pos(obj, anchor)) continue;
-                Vector3 top = anchor; top.y += g_head_off;
-                Vector3 bot = anchor; bot.y += g_feet_off;
+                Vector3 top = anchor; top.y += headoff;
+                Vector3 bot = anchor; bot.y += feetoff;
                 Vector3 sTop = W2S(cam, top, NULL);
                 Vector3 sBot = W2S(cam, bot, NULL);
                 if (sBot.z <= 0.0f || sTop.z <= 0.0f) continue;   // behind camera

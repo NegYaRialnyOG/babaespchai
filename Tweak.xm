@@ -152,6 +152,25 @@ enum BoneIdx { BONE_STOMACH=0, BONE_LOWERCHEST=1, BONE_CHEST=2, BONE_HEAD=3,
                BONE_L_UPARM=10, BONE_L_LOARM=11, BONE_L_HAND=12, BONE_L_UPLEG=13, BONE_L_LOLEG=14 };
 static bool      g_skeleton_on = false;
 
+// --- Name / Health / Armor / Weapon (ports of Esp::Name/Health/Armor/Weapon
+// from the source). All PLH-only, same as skeleton — these fields aren't
+// exposed on BotAI. Offsets confirmed against the BPM 260720 dump exactly the
+// way PlayerObject/PlayerData were: playername/armor/currwpn all shift by the
+// same uniform +8 as the rest of PlayerData; the weapon-item chain
+// (PlayerWeaponObject "it" @0x18, BaseItemInfo "codename" @0x18) is a
+// SEPARATE class from PlayerData so it keeps the Android source's original,
+// unshifted offsets.
+static uintptr_t g_pd_name    = 0x18;   // PlayerData.playername (string_t*)
+static uintptr_t g_pd_armor   = 0x5c;   // PlayerData.armor (int)
+static uintptr_t g_pd_currwpn = 0x138;  // PlayerData.currwpn -> PlayerWeaponObject
+static uintptr_t g_pwo_it     = 0x18;   // PlayerWeaponObject.it -> BaseItemInfo
+static uintptr_t g_item_name  = 0x18;   // BaseItemInfo.codename (string_t*)
+static bool      g_show_name       = false;
+static bool      g_show_health_bar = false;
+static bool      g_show_health_txt = false;
+static bool      g_show_armor_bar  = false;
+static bool      g_show_weapon     = false;
+
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
 static void*     g_asmb       = NULL;   // Assembly-CSharp assembly
@@ -211,6 +230,36 @@ static const char* obj_class_name(void* p) {
         if (c < 0x20 || c > 0x7e) return NULL;
     }
     return NULL;
+}
+
+// Decode a managed (il2cpp) string using the standard, version-stable layout:
+// Il2CppObject header (klass ptr + monitor, 16 bytes) + int32 length @0x10 +
+// UTF-16LE chars starting @0x14. Good enough for player names/weapon
+// codenames (ASCII/BMP) without needing the source's std::wstring_convert
+// (deprecated, and we'd rather not carry the extra dependency for this).
+static std::string read_il2cpp_string(void* strPtr) {
+    if (!safe_ptr(strPtr)) return "";
+    int32_t len = *(int32_t*)((char*)strPtr + 0x10);
+    if (len <= 0 || len > 128) return "";
+    const uint16_t* chars = (const uint16_t*)((char*)strPtr + 0x14);
+    std::string out;
+    out.reserve(len);
+    for (int32_t i = 0; i < len; i++) {
+        uint16_t c = chars[i];
+        if (c == 0) break;
+        if (c < 0x80) out.push_back((char)c);
+        else out.push_back('?');   // non-ASCII: keep length sane, skip full UTF-8 encoding
+    }
+    return out;
+}
+
+// Draw text with a 1px black outline so it stays readable over any
+// background — standard technique, substitutes for the source's custom
+// embedded-font renderer which we don't carry.
+static void draw_outlined_text(ImDrawList* dl, ImVec2 pos, ImU32 color, const char* text) {
+    static const ImVec2 offs[4] = { {-1,0}, {1,0}, {0,-1}, {0,1} };
+    for (auto& o : offs) dl->AddText(ImVec2(pos.x + o.x, pos.y + o.y), IM_COL32(0,0,0,255), text);
+    dl->AddText(pos, color, text);
 }
 
 static uintptr_t image_header_for(const char* needle) {
@@ -544,7 +593,12 @@ static std::vector<CGRect> g_capture_rects;
 // ESP boxes are COMPUTED on the main thread (all il2cpp/game reads happen there)
 // and only DRAWN on the MTKView render thread. Calling il2cpp from the render
 // thread deadlocked against the GC / Metal locks — that was the RESOLVE freeze.
-struct Box { float x, y, w, h; };
+// health/armor default -1 = "no data" (BotAI mode never fills these).
+struct Box {
+    float x, y, w, h;
+    int health = -1, armor = -1;
+    std::string name, weapon;
+};
 static std::mutex        g_boxes_mtx;
 static std::vector<Box>  g_boxes;
 
@@ -702,7 +756,26 @@ static void compute_boxes() {
                         skelSegs.push_back(SkelSeg{ax, ay, bx, by});
                     }
                 }
-                boxes.push_back(Box{ cx - w*0.5f, topY, w, h });
+                Box box{ cx - w*0.5f, topY, w, h };
+                if (plh) {
+                    if (g_show_health_bar || g_show_health_txt) box.health = *(int*)((char*)obj + g_pd_health);
+                    if (g_show_armor_bar) box.armor = *(int*)((char*)obj + g_pd_armor);
+                    if (g_show_name) {
+                        void* nameStr = *(void**)((char*)obj + g_pd_name);
+                        box.name = read_il2cpp_string(nameStr);
+                    }
+                    if (g_show_weapon) {
+                        void* pwo = *(void**)((char*)obj + g_pd_currwpn);
+                        if (safe_ptr(pwo)) {
+                            void* item = *(void**)((char*)pwo + g_pwo_it);
+                            if (safe_ptr(item)) {
+                                void* wname = *(void**)((char*)item + g_item_name);
+                                box.weapon = read_il2cpp_string(wname);
+                            }
+                        }
+                    }
+                }
+                boxes.push_back(box);
             }
             { std::lock_guard<std::mutex> l(g_skel_mtx); g_skel_segs.swap(skelSegs); }
         }
@@ -776,7 +849,12 @@ static void render_frame(float screenW, float screenH) {
 
         if (g_esp_src == 1) {
             ImGui::Checkbox("Skeleton (real bones)", &g_skeleton_on);
-            ImGui::SameLine(); ImGui::TextDisabled("(PLH only — needs PlayerObject.trhb)");
+            ImGui::SameLine(); ImGui::TextDisabled("(PLH only)");
+            ImGui::Checkbox("Name", &g_show_name); ImGui::SameLine();
+            ImGui::Checkbox("Health bar", &g_show_health_bar); ImGui::SameLine();
+            ImGui::Checkbox("Health text", &g_show_health_txt);
+            ImGui::Checkbox("Armor bar", &g_show_armor_bar); ImGui::SameLine();
+            ImGui::Checkbox("Weapon name", &g_show_weapon);
         }
 
         if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {
@@ -853,6 +931,41 @@ static void render_frame(float screenW, float screenH) {
             ImVec2 tl(b.x, b.y), br(b.x + b.w, b.y + b.h);
             dl->AddRect(ImVec2(tl.x-1,tl.y-1), ImVec2(br.x+1,br.y+1), IM_COL32(0,0,0,180), 0,0,3.0f);
             dl->AddRect(tl, br, IM_COL32(255,40,40,255), 0,0,1.5f);
+
+            if (!b.name.empty()) {
+                ImVec2 ts = ImGui::CalcTextSize(b.name.c_str());
+                draw_outlined_text(dl, ImVec2(b.x + b.w*0.5f - ts.x*0.5f, b.y - ts.y - 3),
+                                    IM_COL32(255,255,255,255), b.name.c_str());
+            }
+            if (b.health >= 0) {
+                float barW = 4.0f, bx0 = b.x - barW - 3, bx1 = b.x - 3;
+                ImU32 col = b.health > 75 ? IM_COL32(60,220,60,255) : b.health > 50 ? IM_COL32(230,220,40,255)
+                          : b.health > 25 ? IM_COL32(255,150,30,255) : IM_COL32(230,50,50,255);
+                float ratio = b.health > 100 ? 1.0f : b.health / 100.0f;
+                float filledH = b.h * ratio;
+                dl->AddRectFilled(ImVec2(bx0, b.y), ImVec2(bx1, b.y+b.h), IM_COL32(0,0,0,160));
+                dl->AddRectFilled(ImVec2(bx0, b.y + (b.h - filledH)), ImVec2(bx1, b.y+b.h), col);
+                dl->AddRect(ImVec2(bx0, b.y), ImVec2(bx1, b.y+b.h), IM_COL32(0,0,0,255));
+                if (g_show_health_txt) {
+                    char buf[8]; snprintf(buf, sizeof(buf), "%d", b.health);
+                    ImVec2 ts = ImGui::CalcTextSize(buf);
+                    draw_outlined_text(dl, ImVec2(bx0 - ts.x - 2, b.y + b.h - ts.y), col, buf);
+                }
+            }
+            if (b.armor >= 0 && b.armor > 0) {
+                float barH = 4.0f, ay0 = b.y + b.h + 3, ay1 = ay0 + barH;
+                float ratio = b.armor > 100 ? 1.0f : b.armor / 100.0f;
+                float filledW = b.w * ratio;
+                dl->AddRectFilled(ImVec2(b.x, ay0), ImVec2(b.x+b.w, ay1), IM_COL32(0,0,0,160));
+                dl->AddRectFilled(ImVec2(b.x, ay0), ImVec2(b.x+filledW, ay1), IM_COL32(60,170,255,255));
+                dl->AddRect(ImVec2(b.x, ay0), ImVec2(b.x+b.w, ay1), IM_COL32(0,0,0,255));
+            }
+            if (!b.weapon.empty()) {
+                ImVec2 ts = ImGui::CalcTextSize(b.weapon.c_str());
+                float yoff = b.y + b.h + (b.armor > 0 ? 12.0f : 4.0f);
+                draw_outlined_text(dl, ImVec2(b.x + b.w*0.5f - ts.x*0.5f, yoff),
+                                    IM_COL32(200,200,255,255), b.weapon.c_str());
+            }
         }
     }
     {

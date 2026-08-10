@@ -732,9 +732,15 @@ static void main_pump() {
     if (g_esp_on && g_resolved) compute_boxes();
 }
 
+// Menu visibility, toggled by a 3-finger double-tap anywhere on screen (see
+// ESPGestureTarget below). Starts hidden — ESP boxes/skeleton draw regardless,
+// this only gates the settings window itself.
+static bool g_menu_open = false;
+
 static void render_frame(float screenW, float screenH) {
     std::vector<CGRect> rects;
 
+    if (g_menu_open) {
     ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(30, 40), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(380, 9999));
@@ -835,6 +841,7 @@ static void render_frame(float screenW, float screenH) {
         ImGui::SameLine(); ImGui::TextDisabled("(-> paste to Nyx)");
     }
     ImGui::End();
+    } // g_menu_open
 
     // Publish display size for the main-thread pump, then DRAW cached boxes.
     // No il2cpp/game reads happen on this (render) thread anymore.
@@ -936,11 +943,27 @@ static void render_frame(float screenW, float screenH) {
 }
 @end
 
+// 3-finger double-tap toggles the menu. Attached directly to the GAME's own
+// root view (not our overlay) with cancelsTouchesInView=NO so normal touch
+// controls underneath are never interrupted — only a genuine 3-finger tap
+// (never happens during ordinary one/two-thumb play) fires this.
+@interface ESPGestureTarget : NSObject
+- (void)onTripleTap:(UITapGestureRecognizer*)g;
+@end
+@implementation ESPGestureTarget
+- (void)onTripleTap:(UITapGestureRecognizer*)g { g_menu_open = !g_menu_open; }
+@end
+static ESPGestureTarget* g_gestureTarget = nil;
+
 static ESPWindow*   g_window   = nil;
 static ESPRenderer* g_renderer = nil;
 
 static void setup_overlay() {
     g_prev_step = read_step();   // what the last run reached before dying (if any)
+    // Grab the GAME's real root view before we create our own overlay window
+    // below (which will steal keyWindow status once made key-and-visible).
+    UIView* gameRootView = [UIApplication sharedApplication].keyWindow.rootViewController.view;
+
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return;
     CGRect b = [UIScreen mainScreen].bounds;
@@ -972,12 +995,24 @@ static void setup_overlay() {
     io.FontGlobalScale = 1.4f;
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(1.3f);
+    ImGui::GetStyle().TouchExtraPadding = ImVec2(6.0f, 6.0f);  // finger-sized hit targets, incl. the resize grip
     ImGui_ImplMetal_Init(device);
 
     g_renderer = [ESPRenderer new];
     g_renderer.queue = [device newCommandQueue];
     mtk.delegate = g_renderer;
     [g_window makeKeyAndVisible];
+
+    if (gameRootView) {
+        g_gestureTarget = [ESPGestureTarget new];
+        UITapGestureRecognizer* tap = [[UITapGestureRecognizer alloc]
+            initWithTarget:g_gestureTarget action:@selector(onTripleTap:)];
+        tap.numberOfTouchesRequired = 3;
+        tap.numberOfTapsRequired = 2;
+        tap.cancelsTouchesInView = NO;
+        tap.delaysTouchesBegan = NO;
+        [gameRootView addGestureRecognizer:tap];
+    }
 
     // Main-thread pump: ALL il2cpp/game reads happen here, never on the render
     // thread. Matched to the render thread's 60fps so boxes update every

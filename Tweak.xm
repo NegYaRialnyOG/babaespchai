@@ -61,6 +61,18 @@ static il2cpp_object_get_class_t          il2cpp_object_get_class         = NULL
 static il2cpp_class_get_name_t            il2cpp_class_get_name           = NULL;
 static il2cpp_thread_attach_t             il2cpp_thread_attach            = NULL;
 
+// il2cpp API RVAs pulled from the UnityFramework symbol table (build 260206).
+// dlsym can't see these (not in the export trie), so we call them by address.
+#define RVA_il2cpp_domain_get            0x10afe4c
+#define RVA_il2cpp_domain_assembly_open  0x10afe50
+#define RVA_il2cpp_assembly_get_image    0x10af938
+#define RVA_il2cpp_class_from_name       0x10af96c
+#define RVA_il2cpp_class_get_field       0x10af98c
+#define RVA_il2cpp_field_static_get      0x10b0088
+#define RVA_il2cpp_object_get_class      0x10b027c
+#define RVA_il2cpp_class_get_name        0x10af998
+#define RVA_il2cpp_thread_attach         0x10b030c
+
 // ---------------------------------------------------------------------------
 // Live-tunable offsets / RVAs (all relative to g_image_base)
 // ---------------------------------------------------------------------------
@@ -94,21 +106,26 @@ static uintptr_t image_header_for(const char* needle) {
     return 0;
 }
 
-static void resolve_il2cpp_api() {
-    il2cpp_domain_get                = (il2cpp_domain_get_t)dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
-    il2cpp_domain_assembly_open      = (il2cpp_domain_assembly_open_t)dlsym(RTLD_DEFAULT, "il2cpp_domain_assembly_open");
-    il2cpp_assembly_get_image        = (il2cpp_assembly_get_image_t)dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
-    il2cpp_class_from_name           = (il2cpp_class_from_name_t)dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
-    il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t)dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
-    il2cpp_field_static_get_value    = (il2cpp_field_static_get_value_t)dlsym(RTLD_DEFAULT, "il2cpp_field_static_get_value");
-    il2cpp_object_get_class          = (il2cpp_object_get_class_t)dlsym(RTLD_DEFAULT, "il2cpp_object_get_class");
-    il2cpp_class_get_name            = (il2cpp_class_get_name_t)dlsym(RTLD_DEFAULT, "il2cpp_class_get_name");
-    il2cpp_thread_attach             = (il2cpp_thread_attach_t)dlsym(RTLD_DEFAULT, "il2cpp_thread_attach");
+// Bind the il2cpp API by address (dlsym fails: symbols aren't in the export trie).
+static void resolve_il2cpp_api(uintptr_t base) {
+    #define BIND(fn) fn = (fn##_t)(base + RVA_##fn)
+    BIND(il2cpp_domain_get);
+    BIND(il2cpp_domain_assembly_open);
+    BIND(il2cpp_assembly_get_image);
+    BIND(il2cpp_class_from_name);
+    il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t)(base + RVA_il2cpp_class_get_field);
+    il2cpp_field_static_get_value    = (il2cpp_field_static_get_value_t)   (base + RVA_il2cpp_field_static_get);
+    il2cpp_object_get_class          = (il2cpp_object_get_class_t)         (base + RVA_il2cpp_object_get_class);
+    il2cpp_class_get_name            = (il2cpp_class_get_name_t)           (base + RVA_il2cpp_class_get_name);
+    il2cpp_thread_attach             = (il2cpp_thread_attach_t)            (base + RVA_il2cpp_thread_attach);
+    #undef BIND
 }
 
 static void resolve_all() {
     g_image_base = image_header_for(g_image_name);
     if (!g_image_base) g_image_base = (uintptr_t)_dyld_get_image_header(0);
+
+    resolve_il2cpp_api(g_image_base);
 
     W2S             = g_rva_w2s     ? (W2S_Injected_t)(g_image_base + g_rva_w2s)                : NULL;
     Camera_get_main = g_rva_getmain ? (Camera_get_main_t)(g_image_base + g_rva_getmain)         : NULL;
@@ -217,9 +234,10 @@ static std::vector<CGRect> g_capture_rects;
 static void render_frame(float screenW, float screenH) {
     std::vector<CGRect> rects;
 
-    ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(30, 80), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Blockpost ESP [debug]");
+    ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(30, 40), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(360, 9999));
+    ImGui::Begin("Blockpost ESP");
     {
         ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         rects.push_back(CGRectMake(wp.x, wp.y, ws.x, ws.y));
@@ -229,14 +247,15 @@ static void render_frame(float screenW, float screenH) {
         ImGui::InputInt("Local team", &g_local_team);
         ImGui::SliderFloat("Box height", &g_box_height, 0.5f, 3.0f);
 
-        ImGui::SeparatorText("Offsets (hex, image-relative)");
-        ImGui::InputText("image", g_image_name, sizeof(g_image_name));
-        ImGui::InputScalar("W2S",     ImGuiDataType_U64, &g_rva_w2s,     0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::InputScalar("get_main",ImGuiDataType_U64, &g_rva_getmain, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::InputScalar("TransPos",ImGuiDataType_U64, &g_rva_tp,      0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::InputScalar("ctrl off",ImGuiDataType_U64, &g_off_ctrl,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::InputScalar("team off",ImGuiDataType_U64, &g_off_team,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        if (ImGui::Button("Apply / Re-resolve")) resolve_all();
+        if (ImGui::CollapsingHeader("Offsets (advanced)")) {
+            ImGui::InputText("image", g_image_name, sizeof(g_image_name));
+            ImGui::InputScalar("W2S",     ImGuiDataType_U64, &g_rva_w2s,     0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputScalar("get_main",ImGuiDataType_U64, &g_rva_getmain, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputScalar("TransPos",ImGuiDataType_U64, &g_rva_tp,      0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputScalar("ctrl off",ImGuiDataType_U64, &g_off_ctrl,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            ImGui::InputScalar("team off",ImGuiDataType_U64, &g_off_team,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+            if (ImGui::Button("Apply / Re-resolve")) resolve_all();
+        }
 
         ImGui::SeparatorText("State");
         void* cam = Camera_get_main ? Camera_get_main(NULL) : NULL;
@@ -332,6 +351,16 @@ static void render_frame(float screenW, float screenH) {
 }
 @end
 
+// Orientation-locked host: Blockpost runs landscape; stop the overlay flipping.
+@interface ESPVC : UIViewController
+@end
+@implementation ESPVC
+- (BOOL)shouldAutorotate { return NO; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (BOOL)prefersStatusBarHidden { return YES; }
+- (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+@end
+
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
@@ -349,14 +378,18 @@ static ESPRenderer* g_renderer = nil;
 static void setup_overlay() {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return;
-    CGRect frame = [UIScreen mainScreen].bounds;
+    // force landscape geometry (wider than tall) so we never inherit a
+    // portrait frame if the app briefly reports one during launch
+    CGRect b = [UIScreen mainScreen].bounds;
+    CGRect frame = (b.size.width < b.size.height)
+                 ? CGRectMake(0, 0, b.size.height, b.size.width) : b;
 
     g_window = [[ESPWindow alloc] initWithFrame:frame];
     g_window.windowLevel = UIWindowLevelStatusBar + 1000;
     g_window.backgroundColor = [UIColor clearColor];
     g_window.opaque = NO;
 
-    UIViewController* vc = [UIViewController new];
+    ESPVC* vc = [ESPVC new];
     g_window.rootViewController = vc;
 
     ESPView* mtk = [[ESPView alloc] initWithFrame:frame device:device];
@@ -373,9 +406,9 @@ static void setup_overlay() {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = NULL;
-    io.FontGlobalScale = 2.0f;
+    io.FontGlobalScale = 1.4f;
     ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(2.0f);
+    ImGui::GetStyle().ScaleAllSizes(1.3f);
     ImGui_ImplMetal_Init(device);
 
     g_renderer = [ESPRenderer new];
@@ -386,7 +419,6 @@ static void setup_overlay() {
 
 // ---------------------------------------------------------------------------
 %ctor {
-    resolve_il2cpp_api();
     // give il2cpp + the app UI time to come up before we resolve/overlay
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{

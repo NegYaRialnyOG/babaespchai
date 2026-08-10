@@ -179,6 +179,27 @@ static bool      g_show_health_txt = false;
 static bool      g_show_armor_bar  = false;
 static bool      g_show_weapon     = false;
 
+// --- Visual aimbot: plain field write, no function hooking ---------------
+// ExampleCharacterController.lookInputVector (public field, name AND offset
+// both survived obfuscation untouched — it's part of the open-source
+// KinematicCharacterController asset, offsets confirmed identical to the
+// Android source: moveInputVector=0xF0, lookInputVector=0xFC). This is the
+// SAME field the game's own touch-drag code writes every frame to steer the
+// camera — we just also write to it, so the character visibly turns toward
+// the target exactly like a real touch-drag would. No hooking, no send_pos
+// interception (there were 5 signature-identical candidates for that in the
+// dump and no safe way to tell them apart without a disassembler — hooking
+// the wrong one risks crashing every time the player moves).
+static uintptr_t g_ecc_lookInput = 0xfc;   // ExampleCharacterController.lookInputVector (Vector3)
+static char      g_ecc_ns[64]    = "KinematicCharacterController.Examples";
+static char      g_ecc_cls[64]   = "ExampleCharacterController";
+static void*     g_ecc_type_obj  = NULL;   // cached System.Type for the above
+static bool      g_aimbot_on         = false;
+static float     g_aimbot_fov_px     = 220.0f;  // max screen-space distance (UI points) from crosshair to consider a target
+static float     g_aimbot_smooth     = 0.25f;   // 0..1 lerp factor per tick toward the target direction (lower = smoother/slower)
+static float     g_aimbot_eye_off    = 1.5f;    // world units up from controller anchor to eye height
+static int       g_aimbot_bone       = BONE_CHEST; // which bone to aim at, when bones are available
+
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
 static void*     g_asmb       = NULL;   // Assembly-CSharp assembly
@@ -209,7 +230,8 @@ static int read_step() {
 
 static bool g_esp_on       = false;
 static bool g_enemies_only = false;
-static int  g_local_team   = -1;
+static int  g_local_team   = -1;   // manual override; -1 = use auto-detected (PLH only)
+static int  g_auto_local_team_display = -1;  // last auto-detected team, for the UI
 
 static bool g_dbg_names = false;
 static bool g_dbg_pos   = false;
@@ -428,7 +450,8 @@ static void resolve_all() {
     g_plh_field_score = best_score;
 
     write_step(15); g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
-    write_step(16); g_dom = NULL; g_resolved = true;
+    write_step(16); g_ecc_type_obj = g_img ? type_object_for(g_ecc_ns, g_ecc_cls) : NULL;
+    write_step(17); g_dom = NULL; g_resolved = true;
 }
 
 // Read the PLH static player array and collect element pointers (valid this
@@ -670,15 +693,34 @@ static void compute_boxes() {
             std::vector<Vector3> accepted;
             std::vector<SkelSeg> skelSegs;
             const float aspect = (screenH > 0) ? (screenW / screenH) : 1.7778f;
+
+            // Auto-detect the local player's team from the localplayer flag —
+            // no need to hand-type "Local team" for PLH (that field stays
+            // around only as a manual override / for BotAI mode, where there's
+            // no such flag to read). Was the actual reason "Enemies only" did
+            // nothing: g_local_team defaults to -1 (disabled) and nobody had
+            // typed a team number in, so the filter's guard never activated.
+            int autoLocalTeam = -1;
+            if (plh) {
+                for (void* obj : targets) {
+                    if (*(bool*)((char*)obj + g_pd_local)) {
+                        autoLocalTeam = *(int*)((char*)obj + g_pd_team);
+                        break;
+                    }
+                }
+            }
+            const int effectiveLocalTeam = (g_local_team >= 0) ? g_local_team : autoLocalTeam;
+            g_auto_local_team_display = autoLocalTeam;
+
             for (void* obj : targets) {
                 Vector3 anchor; float headoff, feetoff;
                 if (plh) {
                     if (*(bool*)((char*)obj + g_pd_local)) continue;
                     int hp = *(int*)((char*)obj + g_pd_health);
                     if (hp <= 0) continue;
-                    if (g_enemies_only && g_local_team >= 0) {
+                    if (g_enemies_only && effectiveLocalTeam >= 0) {
                         int tm = *(int*)((char*)obj + g_pd_team);
-                        if (tm == g_local_team) continue;
+                        if (tm == effectiveLocalTeam) continue;
                     }
                     anchor = *(Vector3*)((char*)obj + g_pd_pos);
                     headoff = g_pd_head_off; feetoff = g_pd_feet_off;
@@ -794,6 +836,84 @@ static void compute_boxes() {
 }
 
 // The main-thread pump: does all il2cpp/game work off the render thread.
+// Visual aimbot: no hooking, just a field write into the local player's own
+// ExampleCharacterController.lookInputVector — the same field the game's own
+// touch-drag code writes every frame, so the camera visibly turns exactly
+// like a real drag would. Target = nearest-to-screen-center living enemy
+// within g_aimbot_fov_px, aimed at a real bone when available (else the flat
+// Pos field), eased in by g_aimbot_smooth so it doesn't snap instantly.
+static void run_aimbot() {
+    if (!g_aimbot_on || !g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) return;
+    if (!g_ecc_type_obj) return;
+
+    std::vector<void*> controllers;
+    enum_type(g_ecc_type_obj, controllers);
+    if (controllers.empty()) return;
+    void* controller = controllers[0];   // only the local player runs this controller
+
+    void* ctrlTf = Comp_get_tf(controller, NULL);
+    if (!safe_ptr(ctrlTf)) return;
+    Vector3 eye = Tf_get_pos(ctrlTf, NULL);
+    eye.y += g_aimbot_eye_off;
+
+    void* cam = Camera_get_main(NULL);
+    if (!cam) return;
+
+    float gameW = Camera_get_pixelWidth  ? (float)Camera_get_pixelWidth(cam, NULL)  : g_scrW;
+    float gameH = Camera_get_pixelHeight ? (float)Camera_get_pixelHeight(cam, NULL) : g_scrH;
+    if (gameW <= 0) gameW = g_scrW;
+    if (gameH <= 0) gameH = g_scrH;
+    if (g_scrW <= 0 || g_scrH <= 0 || gameW <= 0 || gameH <= 0) return;
+    const float sx = g_scrW / gameW, sy = g_scrH / gameH;
+    const float cxScreen = g_scrW * 0.5f, cyScreen = g_scrH * 0.5f;
+
+    std::vector<void*> players;
+    enum_plh_players(players);
+
+    // Same auto-detected local-team logic as the ESP box filter, kept in sync
+    // manually since this runs on a separate pass over the player list.
+    int autoLocalTeam = -1;
+    for (void* obj : players) {
+        if (*(bool*)((char*)obj + g_pd_local)) { autoLocalTeam = *(int*)((char*)obj + g_pd_team); break; }
+    }
+    const int effectiveLocalTeam = (g_local_team >= 0) ? g_local_team : autoLocalTeam;
+
+    void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{};
+    for (void* obj : players) {
+        if (*(bool*)((char*)obj + g_pd_local)) continue;
+        int hp = *(int*)((char*)obj + g_pd_health);
+        if (hp <= 0) continue;
+        if (g_enemies_only && effectiveLocalTeam >= 0) {
+            int tm = *(int*)((char*)obj + g_pd_team);
+            if (tm == effectiveLocalTeam) continue;
+        }
+        Vector3 aimPoint, bonePos;
+        if (get_bone_pos(obj, g_aimbot_bone, bonePos)) aimPoint = bonePos;
+        else aimPoint = *(Vector3*)((char*)obj + g_pd_pos);
+
+        Vector3 s = W2S(cam, aimPoint, NULL);
+        if (s.z <= 0.0f) continue;
+        float ux = s.x * sx, uy = g_scrH - (s.y * sy);
+        float dx = ux - cxScreen, dy = uy - cyScreen;
+        float d2 = dx*dx + dy*dy;
+        if (d2 > g_aimbot_fov_px * g_aimbot_fov_px) continue;
+        if (d2 < bestDist2) { bestDist2 = d2; best = obj; bestAimPoint = aimPoint; }
+    }
+    if (!best) return;
+
+    Vector3 dir;
+    dir.x = bestAimPoint.x - eye.x; dir.y = bestAimPoint.y - eye.y; dir.z = bestAimPoint.z - eye.z;
+    float len = sqrtf(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
+    if (len < 0.001f) return;
+    dir.x /= len; dir.y /= len; dir.z /= len;
+
+    Vector3* cur = (Vector3*)((char*)controller + g_ecc_lookInput);
+    float t = g_aimbot_smooth; if (t < 0.02f) t = 0.02f; if (t > 1.0f) t = 1.0f;
+    cur->x += (dir.x - cur->x) * t;
+    cur->y += (dir.y - cur->y) * t;
+    cur->z += (dir.z - cur->z) * t;
+}
+
 static void main_pump() {
     if (g_want_resolve) { g_want_resolve = false; resolve_all(); }
     if (g_want_replh) {
@@ -811,6 +931,7 @@ static void main_pump() {
     }
     if (g_resolved) { std::vector<void*> v; g_plh_count = enum_plh_players(v); }
     if (g_esp_on && g_resolved) compute_boxes();
+    if (g_aimbot_on && g_resolved) run_aimbot();
 }
 
 // Menu visibility, toggled by a 3-finger double-tap anywhere on screen (see
@@ -843,6 +964,10 @@ static void render_frame(float screenW, float screenH) {
         ImGui::RadioButton("FindObjectsOfType", &g_esp_src, 0);
         ImGui::InputInt("Local team", &g_local_team);
         if (g_esp_src == 1) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(auto=%d, -1 uses auto)", g_auto_local_team_display);
+        }
+        if (g_esp_src == 1) {
             ImGui::SliderFloat("Box top",   &g_pd_head_off, -1.0f, 3.0f);
             ImGui::SliderFloat("Box bottom",&g_pd_feet_off, -3.0f, 1.0f);
             ImGui::SameLine();
@@ -863,6 +988,19 @@ static void render_frame(float screenW, float screenH) {
             ImGui::Checkbox("Health text", &g_show_health_txt);
             ImGui::Checkbox("Armor bar", &g_show_armor_bar); ImGui::SameLine();
             ImGui::Checkbox("Weapon name", &g_show_weapon);
+
+            ImGui::SeparatorText("Aimbot (visual — no hooking)");
+            ImGui::Checkbox("Aimbot", &g_aimbot_on);
+            ImGui::SameLine(); ImGui::TextDisabled("(writes lookInputVector, camera visibly turns)");
+            ImGui::SliderFloat("FOV (px)", &g_aimbot_fov_px, 20.0f, 600.0f);
+            ImGui::SliderFloat("Smoothness", &g_aimbot_smooth, 0.02f, 1.0f);
+            ImGui::SameLine(); ImGui::TextDisabled("(low=slow/smooth, 1=instant snap)");
+            static const char* boneNames[] = {"stomach","lowerChest","chest","head"};
+            static int boneSel = 2; // chest default
+            if (ImGui::Combo("Aim bone", &boneSel, boneNames, 4)) {
+                static const int boneVals[] = {BONE_STOMACH, BONE_LOWERCHEST, BONE_CHEST, BONE_HEAD};
+                g_aimbot_bone = boneVals[boneSel];
+            }
         }
 
         if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {
@@ -892,13 +1030,14 @@ static void render_frame(float screenW, float screenH) {
         if (ImGui::Button("RESOLVE il2cpp (tap in-game)")) g_want_resolve = true;
         ImGui::Text("resolved=%d step=%d attached=%d", g_resolved ? 1 : 0, g_resolve_step, g_attached ? 1 : 0);
         ImGui::Text("PREV RUN reached step=%d", g_prev_step);
-        ImGui::TextDisabled("(10 bind,11 asm_open,12 img,13 PLHcls,14 fld,15 type,16 done)");
+        ImGui::TextDisabled("(10 bind,11 asm_open,12 img,13 PLHcls,14 fld,15 type,16 ecc_type,17 done)");
         ImGui::InputText("assembly", g_asm_name, sizeof(g_asm_name));
         ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
         ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
         ImGui::Text("PLH klass=%p fld=%p (auto: %s, score=%d)", g_plh_klass, g_plh_fld, g_plh_field, g_plh_field_score);
         ImGui::Text("PLH players now=%d  boxes=%d", g_plh_count, (int)g_boxes.size());
+        ImGui::Text("aimbot controller type_obj=%p", g_ecc_type_obj);
         {
             std::lock_guard<std::mutex> l(g_calib_mtx);
             if (g_calib.valid)

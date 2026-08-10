@@ -489,6 +489,14 @@ static std::vector<CGRect> g_capture_rects;
 struct Box { float x, y, w, h; };
 static std::mutex        g_boxes_mtx;
 static std::vector<Box>  g_boxes;
+
+// Calibration markers: screen position of the FIRST target's raw anchor
+// (zero offset) and the same anchor +1.0 world unit up. Drawn as dots in-game
+// so a single screenshot gives exact pixel ground-truth for where the anchor
+// sits relative to the character — no more guessing box top/bottom offsets.
+struct CalibMarks { bool valid; float x0, y0, x1, y1; };
+static std::mutex   g_calib_mtx;
+static CalibMarks   g_calib = { false, 0, 0, 0, 0 };
 static bool              g_want_resolve = false;   // button -> main thread does resolve_all
 static bool              g_want_debug   = false;   // button -> main thread builds debug dump
 static bool              g_want_replh   = false;   // button -> main thread re-resolves PLH class/field
@@ -500,6 +508,7 @@ static int               g_plh_count = 0;          // players seen by last main 
 static void compute_boxes() {
     std::vector<Box> boxes;
     float screenW = g_scrW, screenH = g_scrH;
+    bool calibDone = false;
     if (g_esp_on && g_resolved && W2S && Camera_get_main && screenW > 0) {
         std::vector<void*> targets;
         bool plh = (g_esp_src == 1);
@@ -542,6 +551,18 @@ static void compute_boxes() {
                 if (dup) continue;
                 accepted.push_back(anchor);
 
+                if (!calibDone) {
+                    Vector3 p0 = anchor;
+                    Vector3 p1 = anchor; p1.y += 1.0f;
+                    Vector3 s0 = W2S(cam, p0, NULL);
+                    Vector3 s1 = W2S(cam, p1, NULL);
+                    if (s0.z > 0.0f && s1.z > 0.0f) {
+                        std::lock_guard<std::mutex> l(g_calib_mtx);
+                        g_calib = { true, s0.x, screenH - s0.y, s1.x, screenH - s1.y };
+                        calibDone = true;
+                    }
+                }
+
                 Vector3 top = anchor; top.y += headoff;
                 Vector3 bot = anchor; bot.y += feetoff;
                 Vector3 sTop = W2S(cam, top, NULL);
@@ -556,6 +577,7 @@ static void compute_boxes() {
             }
         }
     }
+    if (!calibDone) { std::lock_guard<std::mutex> l(g_calib_mtx); g_calib.valid = false; }
     { std::lock_guard<std::mutex> l(g_boxes_mtx); g_boxes.swap(boxes); }
 }
 
@@ -649,6 +671,14 @@ static void render_frame(float screenW, float screenH) {
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
         ImGui::Text("PLH klass=%p fld=%p (auto: %s, score=%d)", g_plh_klass, g_plh_fld, g_plh_field, g_plh_field_score);
         ImGui::Text("PLH players now=%d  boxes=%d", g_plh_count, (int)g_boxes.size());
+        {
+            std::lock_guard<std::mutex> l(g_calib_mtx);
+            if (g_calib.valid)
+                ImGui::Text("CALIB yellow=(%.0f,%.0f) cyan=(%.0f,%.0f) [1 unit = %.1fpx]",
+                             g_calib.x0, g_calib.y0, g_calib.x1, g_calib.y1, g_calib.y0 - g_calib.y1);
+            else
+                ImGui::TextDisabled("CALIB: no target in view");
+        }
 
         if (ImGui::CollapsingHeader("PlayerData offsets")) {
             ImGui::InputText("PLH class", g_plh_cls, sizeof(g_plh_cls));
@@ -680,6 +710,19 @@ static void render_frame(float screenW, float screenH) {
             ImVec2 tl(b.x, b.y), br(b.x + b.w, b.y + b.h);
             dl->AddRect(ImVec2(tl.x-1,tl.y-1), ImVec2(br.x+1,br.y+1), IM_COL32(0,0,0,180), 0,0,3.0f);
             dl->AddRect(tl, br, IM_COL32(255,40,40,255), 0,0,1.5f);
+        }
+    }
+    // Calibration dots: yellow = raw anchor (zero offset), cyan = anchor +1
+    // world unit up. Screenshot these next to the character and the exact
+    // pixel gap tells us precisely what offset the box top/bottom need —
+    // no more guessing.
+    {
+        std::lock_guard<std::mutex> l(g_calib_mtx);
+        if (g_calib.valid) {
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            dl->AddCircleFilled(ImVec2(g_calib.x0, g_calib.y0), 5.0f, IM_COL32(255,255,0,255));
+            dl->AddCircleFilled(ImVec2(g_calib.x1, g_calib.y1), 5.0f, IM_COL32(0,255,255,255));
+            dl->AddLine(ImVec2(g_calib.x0, g_calib.y0), ImVec2(g_calib.x1, g_calib.y1), IM_COL32(255,255,255,180), 1.5f);
         }
     }
 

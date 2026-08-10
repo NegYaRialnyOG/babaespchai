@@ -15,6 +15,7 @@
 #include <vector>
 #include <mutex>
 #include <string>
+#include <cmath>
 
 #include "imgui.h"
 #include "imgui_impl_metal.h"
@@ -104,7 +105,12 @@ static float     g_width_mult     = 0.45f;     // box width as fraction of its h
 // single-array build used, so that's the default. Class/field names are
 // obfuscated per-build and WILL change again on the next game update — hence
 // the live text inputs below instead of hardcoding forever.
-static int  g_esp_src   = 1;            // 0 = FindObjectsOfType(class), 1 = PLH players
+// Default to FindObjectsOfType(BotAI) — confirmed correct on-target in a bots
+// match. PLH mode is for real networked players; in a bots-only match its
+// array slots are mostly stale/unused, which used to slip past the sanity
+// check and draw garbage boxes nowhere near anyone. Switch to PLH manually
+// once you're in a real player match.
+static int  g_esp_src   = 0;            // 0 = FindObjectsOfType(class), 1 = PLH players
 static char g_plh_cls[32]   = "PLH";
 static char g_plh_field[32] = "PAFMAJGGFBD";   // auto-picked by resolve_all; this is just the last winner
 // Every field PLH could plausibly hold the player array under, tried automatically.
@@ -247,9 +253,12 @@ static char g_asm_name[48] = "Assembly-CSharp.dll";   // exactly like the source
 
 // Resolve exactly like the Android source: NO il2cpp_domain_get (that's what
 // hung at step 11), NO thread_attach. Just domain_assembly_open(NULL, name).
-// Score a candidate static field: read it, count entries that look like a real
-// PlayerData (safe pointer + health in a sane range + team in a sane range).
-// Returns -1 if the field itself doesn't resolve or isn't a readable array.
+// Score a candidate static field: read it, count entries that look like a
+// LIVE real PlayerData — alive (hp>0, not just "small int"), sane team, AND a
+// finite/plausible world position. hp==0 or a default-zeroed struct passes a
+// loose "small int" check trivially, which is exactly what made stale/unused
+// array slots in a bots match masquerade as real players before. Returns -1
+// if the field itself doesn't resolve or isn't a readable array.
 static int score_plh_field(void* fld) {
     if (!fld || !il2cpp_field_static_get_value) return -1;
     void* arr = NULL;
@@ -263,7 +272,13 @@ static int score_plh_field(void* fld) {
         if (!safe_ptr(o)) continue;
         int hp = *(int*)((char*)o + g_pd_health);
         int tm = *(int*)((char*)o + g_pd_team);
-        if (hp >= -1 && hp <= 1000 && tm >= -1 && tm <= 16) good++;
+        if (hp <= 0 || hp > 1000) continue;         // must be alive, not a default/dead slot
+        if (tm < -1 || tm > 16) continue;
+        Vector3 p = *(Vector3*)((char*)o + g_pd_pos);
+        bool finite = (p.x == p.x) && (p.y == p.y) && (p.z == p.z);  // reject NaN
+        if (!finite) continue;
+        if (fabsf(p.x) > 100000.0f || fabsf(p.y) > 100000.0f || fabsf(p.z) > 100000.0f) continue;
+        good++;
     }
     return good;
 }

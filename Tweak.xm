@@ -217,7 +217,7 @@ static void bind_pointers() {
 // domain. Calling any reflection/allocating il2cpp function from an unattached
 // thread deadlocks against the GC world-stop — that was the RESOLVE freeze.
 static bool g_attached = false;
-static bool ensure_attached() {
+__attribute__((unused)) static bool ensure_attached() {
     if (g_attached) return true;
     if (!il2cpp_domain_get || !il2cpp_thread_attach) return false;
     if (il2cpp_thread_current && il2cpp_thread_current()) { g_attached = true; return true; }

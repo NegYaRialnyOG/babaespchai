@@ -411,6 +411,79 @@ static std::string build_debug_dump() {
 static std::mutex          g_rects_mtx;
 static std::vector<CGRect> g_capture_rects;
 
+// ESP boxes are COMPUTED on the main thread (all il2cpp/game reads happen there)
+// and only DRAWN on the MTKView render thread. Calling il2cpp from the render
+// thread deadlocked against the GC / Metal locks — that was the RESOLVE freeze.
+struct Box { float x, y, w, h; };
+static std::mutex        g_boxes_mtx;
+static std::vector<Box>  g_boxes;
+static bool              g_want_resolve = false;   // button -> main thread does resolve_all
+static bool              g_want_debug   = false;   // button -> main thread builds debug dump
+static float             g_scrW = 0, g_scrH = 0;   // last display size from render thread
+static int               g_plh_count = 0;          // players seen by last main pump
+
+// Compute ESP boxes on the MAIN thread. Mirrors the old inline projection but
+// writes results into g_boxes for the render thread to draw.
+static void compute_boxes() {
+    std::vector<Box> boxes;
+    float screenW = g_scrW, screenH = g_scrH;
+    if (g_esp_on && g_resolved && W2S && Camera_get_main && screenW > 0) {
+        std::vector<void*> targets;
+        bool plh = (g_esp_src == 1);
+        if (plh) enum_plh_players(targets); else find_targets(targets);
+        void* cam = Camera_get_main(NULL);
+        if (cam) {
+            for (void* obj : targets) {
+                Vector3 anchor; float headoff, feetoff;
+                if (plh) {
+                    if (*(bool*)((char*)obj + g_pd_local)) continue;
+                    int hp = *(int*)((char*)obj + g_pd_health);
+                    if (hp <= 0) continue;
+                    if (g_enemies_only && g_local_team >= 0) {
+                        int tm = *(int*)((char*)obj + g_pd_team);
+                        if (tm == g_local_team) continue;
+                    }
+                    anchor = *(Vector3*)((char*)obj + g_pd_pos);
+                    headoff = g_pd_head_off; feetoff = g_pd_feet_off;
+                } else {
+                    if (!Tf_get_pos || !g_type_obj) continue;
+                    if (g_enemies_only && g_off_team && g_local_team >= 0) {
+                        int tm = obj_team(obj);
+                        if (tm == g_local_team) continue;
+                    }
+                    if (!obj_pos(obj, anchor)) continue;
+                    headoff = g_head_off; feetoff = g_feet_off;
+                }
+                Vector3 top = anchor; top.y += headoff;
+                Vector3 bot = anchor; bot.y += feetoff;
+                Vector3 sTop = W2S(cam, top, NULL);
+                Vector3 sBot = W2S(cam, bot, NULL);
+                if (sBot.z <= 0.0f || sTop.z <= 0.0f) continue;
+                float botY = screenH - sBot.y, topY = screenH - sTop.y;
+                float cx = (sTop.x + sBot.x) * 0.5f;
+                if (cx <= 0 || cx >= screenW) continue;
+                float h = botY - topY; if (h < 6) h = 6;
+                float w = h * g_width_mult;
+                boxes.push_back(Box{ cx - w*0.5f, topY, w, h });
+            }
+        }
+    }
+    { std::lock_guard<std::mutex> l(g_boxes_mtx); g_boxes.swap(boxes); }
+}
+
+// The main-thread pump: does all il2cpp/game work off the render thread.
+static void main_pump() {
+    if (g_want_resolve) { g_want_resolve = false; resolve_all(); }
+    if (g_want_debug) {
+        g_want_debug = false;
+        g_debug_text = build_debug_dump();
+        [UIPasteboard generalPasteboard].string =
+            [NSString stringWithUTF8String:g_debug_text.c_str()];
+    }
+    if (g_resolved) { std::vector<void*> v; g_plh_count = enum_plh_players(v); }
+    if (g_esp_on && g_resolved) compute_boxes();
+}
+
 static void render_frame(float screenW, float screenH) {
     std::vector<CGRect> rects;
 
@@ -460,7 +533,7 @@ static void render_frame(float screenW, float screenH) {
         }
 
         ImGui::SeparatorText("State");
-        if (ImGui::Button("RESOLVE il2cpp (tap in-game)")) resolve_all();
+        if (ImGui::Button("RESOLVE il2cpp (tap in-game)")) g_want_resolve = true;
         ImGui::Text("resolved=%d step=%d attached=%d", g_resolved ? 1 : 0, g_resolve_step, g_attached ? 1 : 0);
         ImGui::Text("PREV RUN reached step=%d", g_prev_step);
         ImGui::TextDisabled("(10 bind,11 domget,12 attach,13 dom,14 asm,15 img,16 type,17 PLHcls,18 fld,19 done)");
@@ -468,11 +541,7 @@ static void render_frame(float screenW, float screenH) {
         ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
         ImGui::Text("PLH klass=%p fld=%p", g_plh_klass, g_plh_fld);
-        if (g_resolved) {
-            std::vector<void*> v; int pc = enum_plh_players(v);
-            ImGui::Text("PLH players now=%d", pc);
-        }
-        ImGui::Text("last scan=%d", g_scan_count);
+        ImGui::Text("PLH players now=%d  boxes=%d", g_plh_count, (int)g_boxes.size());
 
         if (ImGui::CollapsingHeader("PlayerData offsets")) {
             ImGui::InputScalar("Pos",    ImGuiDataType_U64, &g_pd_pos,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
@@ -482,67 +551,25 @@ static void render_frame(float screenW, float screenH) {
         }
 
         ImGui::SeparatorText("Self-test / offset explorer");
-        if (ImGui::Button("1. Scan count")) { std::vector<void*> v; g_scan_count = find_targets(v); }
         ImGui::Checkbox("2. class names", &g_dbg_names);
         ImGui::Checkbox("3. positions", &g_dbg_pos);
         ImGui::Checkbox("4. project (W2S)", &g_dbg_w2s);
 
-        if (ImGui::Button("Copy Debug (probe + scan)")) {
-            g_debug_text = build_debug_dump();
-            [UIPasteboard generalPasteboard].string =
-                [NSString stringWithUTF8String:g_debug_text.c_str()];
-        }
+        if (ImGui::Button("Copy Debug (probe + scan)")) g_want_debug = true;
         ImGui::SameLine(); ImGui::TextDisabled("(-> paste to Nyx)");
     }
     ImGui::End();
 
-    // ESP: enumerate FRESH this frame and use immediately (no stale cache).
-    // Gated behind g_resolved so we never touch the runtime before it's ready.
-    if (g_esp_on && g_resolved && ensure_attached() && W2S && Camera_get_main) {
-        std::vector<void*> targets;
-        bool plh = (g_esp_src == 1);
-        if (plh) enum_plh_players(targets);
-        else     find_targets(targets);
-        void* cam = Camera_get_main(NULL);
-        if (cam) {
-            ImDrawList* dl = ImGui::GetForegroundDrawList();
-            for (void* obj : targets) {
-                Vector3 anchor; float headoff, feetoff;
-                if (plh) {
-                    // real players: direct fields, no Transform needed
-                    if (*(bool*)((char*)obj + g_pd_local)) continue;      // skip self
-                    int hp = *(int*)((char*)obj + g_pd_health);
-                    if (hp <= 0) continue;                                 // dead/respawning
-                    if (g_enemies_only && g_local_team >= 0) {
-                        int tm = *(int*)((char*)obj + g_pd_team);
-                        if (tm == g_local_team) continue;
-                    }
-                    anchor = *(Vector3*)((char*)obj + g_pd_pos);
-                    headoff = g_pd_head_off; feetoff = g_pd_feet_off;
-                } else {
-                    if (!Tf_get_pos || !g_type_obj) continue;
-                    if (g_enemies_only && g_off_team && g_local_team >= 0) {
-                        int tm = obj_team(obj);
-                        if (tm == g_local_team) continue;
-                    }
-                    if (!obj_pos(obj, anchor)) continue;
-                    headoff = g_head_off; feetoff = g_feet_off;
-                }
-                Vector3 top = anchor; top.y += headoff;
-                Vector3 bot = anchor; bot.y += feetoff;
-                Vector3 sTop = W2S(cam, top, NULL);
-                Vector3 sBot = W2S(cam, bot, NULL);
-                if (sBot.z <= 0.0f || sTop.z <= 0.0f) continue;   // behind camera
-                float botY = screenH - sBot.y;      // Unity bottom-left -> UIKit top-left
-                float topY = screenH - sTop.y;
-                float cx   = (sTop.x + sBot.x) * 0.5f;
-                if (cx <= 0 || cx >= screenW) continue;
-                float h = botY - topY; if (h < 6) h = 6;
-                float w = h * g_width_mult;
-                ImVec2 tl(cx - w*0.5f, topY), br(cx + w*0.5f, botY);
-                dl->AddRect(ImVec2(tl.x-1,tl.y-1), ImVec2(br.x+1,br.y+1), IM_COL32(0,0,0,180), 0,0,3.0f);
-                dl->AddRect(tl, br, IM_COL32(255,40,40,255), 0,0,1.5f);
-            }
+    // Publish display size for the main-thread pump, then DRAW cached boxes.
+    // No il2cpp/game reads happen on this (render) thread anymore.
+    g_scrW = screenW; g_scrH = screenH;
+    {
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        std::lock_guard<std::mutex> l(g_boxes_mtx);
+        for (const Box& b : g_boxes) {
+            ImVec2 tl(b.x, b.y), br(b.x + b.w, b.y + b.h);
+            dl->AddRect(ImVec2(tl.x-1,tl.y-1), ImVec2(br.x+1,br.y+1), IM_COL32(0,0,0,180), 0,0,3.0f);
+            dl->AddRect(tl, br, IM_COL32(255,40,40,255), 0,0,1.5f);
         }
     }
 
@@ -654,6 +681,11 @@ static void setup_overlay() {
     g_renderer.queue = [device newCommandQueue];
     mtk.delegate = g_renderer;
     [g_window makeKeyAndVisible];
+
+    // Main-thread pump: ALL il2cpp/game reads happen here, never on the render
+    // thread. ~30 Hz is plenty for ESP and keeps the main runloop light.
+    [NSTimer scheduledTimerWithTimeInterval:1.0/30.0 repeats:YES
+                                      block:^(NSTimer* t) { main_pump(); }];
 }
 
 // ---------------------------------------------------------------------------

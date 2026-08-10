@@ -81,8 +81,12 @@ static float     g_feet_off       = -1.9f;     // world units from anchor down t
 static float     g_width_mult     = 0.45f;     // box width as fraction of its height
 
 static uintptr_t g_image_base = 0;
+static void*     g_dom        = NULL;   // il2cpp domain
+static void*     g_asmb       = NULL;   // Assembly-CSharp assembly
 static void*     g_img        = NULL;   // Assembly-CSharp image
 static void*     g_type_obj   = NULL;   // cached System.Type for g_target_cls
+static bool      g_resolved   = false;  // resolve_all completed at least once
+static int       g_resolve_step = 0;    // last stage reached (for crash localization)
 
 static bool g_esp_on       = false;
 static bool g_enemies_only = false;
@@ -135,7 +139,8 @@ static void* type_object_for(const char* ns, const char* name) {
     return il2cpp_type_get_object(t);
 }
 
-static void resolve_all() {
+// Bind function pointers only (no game calls) — always safe.
+static void bind_pointers() {
     g_image_base = image_header_for(g_image_name);
     if (!g_image_base) g_image_base = (uintptr_t)_dyld_get_image_header(0);
     uintptr_t B = g_image_base;
@@ -154,11 +159,23 @@ static void resolve_all() {
     il2cpp_type_get_object      = (il2cpp_type_get_object_t)     (B + RVA_il2cpp_type_get_object);
     il2cpp_object_get_class     = (il2cpp_object_get_class_t)    (B + RVA_il2cpp_object_get_class);
     il2cpp_class_get_name       = (il2cpp_class_get_name_t)      (B + RVA_il2cpp_class_get_name);
+}
 
-    void* dom = il2cpp_domain_get();
-    void* asmb = dom ? il2cpp_domain_assembly_open(dom, "Assembly-CSharp") : NULL;
-    g_img = asmb ? il2cpp_assembly_get_image(asmb) : NULL;
-    g_type_obj = type_object_for(g_target_ns, g_target_cls);
+// Stepwise il2cpp resolve. g_resolve_step records how far we got so a crash
+// pinpoints the offending call. NEVER auto-run at load — the domain/metadata
+// may not be ready yet; call from the menu once you're in-game.
+static void resolve_all() {
+    bind_pointers();
+    g_resolve_step = 1;
+    g_dom = il2cpp_domain_get();
+    g_resolve_step = 2;
+    g_asmb = g_dom ? il2cpp_domain_assembly_open(g_dom, "Assembly-CSharp") : NULL;
+    g_resolve_step = 3;
+    g_img = g_asmb ? il2cpp_assembly_get_image(g_asmb) : NULL;
+    g_resolve_step = 4;
+    g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
+    g_resolve_step = 5;
+    g_resolved = true;
 }
 
 // Enumerate live instances of a Type object. Object[] layout: count @0x18,
@@ -238,6 +255,7 @@ static std::string scan_object(void* o) {
 
 static std::string build_debug_dump() {
     char b[512]; std::string o;
+    if (!g_resolved) return "not resolved yet — tap RESOLVE il2cpp first\n";
     snprintf(b, sizeof(b), "=== Blockpost ESP debug ===\nimage=%s base=0x%lx\n"
              "target=%s.%s off_tf=0x%lx off_team=0x%lx pos_mode=%d\n",
              g_image_name, (unsigned long)g_image_base,
@@ -332,8 +350,12 @@ static void render_frame(float screenW, float screenH) {
         }
 
         ImGui::SeparatorText("State");
-        ImGui::Text("base=0x%lx img=%p", (unsigned long)g_image_base, g_img);
-        ImGui::Text("type_obj=%p  last scan=%d", g_type_obj, g_scan_count);
+        if (ImGui::Button("RESOLVE il2cpp (tap in-game)")) resolve_all();
+        ImGui::Text("resolved=%d  step=%d", g_resolved ? 1 : 0, g_resolve_step);
+        ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
+        ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
+        ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
+        ImGui::Text("last scan=%d", g_scan_count);
 
         ImGui::SeparatorText("Self-test / offset explorer");
         if (ImGui::Button("1. Scan count")) { std::vector<void*> v; g_scan_count = find_targets(v); }
@@ -351,7 +373,8 @@ static void render_frame(float screenW, float screenH) {
     ImGui::End();
 
     // ESP: enumerate FRESH this frame and use immediately (no stale cache).
-    if (g_esp_on && W2S && Camera_get_main && Tf_get_pos && g_type_obj) {
+    // Gated behind g_resolved so we never touch the runtime before it's ready.
+    if (g_esp_on && g_resolved && W2S && Camera_get_main && Tf_get_pos && g_type_obj) {
         std::vector<void*> targets;
         find_targets(targets);
         void* cam = Camera_get_main(NULL);
@@ -493,9 +516,12 @@ static void setup_overlay() {
 
 // ---------------------------------------------------------------------------
 %ctor {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+    // Only bind pointers (safe) and raise the overlay. il2cpp resolve is NOT
+    // done here — it's a manual button in-game, so the menu always appears and
+    // a bad/early runtime call can't kill startup.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        resolve_all();
+        bind_pointers();
         setup_overlay();
     });
 }

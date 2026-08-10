@@ -506,6 +506,13 @@ static void compute_boxes() {
         if (plh) enum_plh_players(targets); else find_targets(targets);
         void* cam = Camera_get_main(NULL);
         if (cam) {
+            // Two entries whose world anchors land within DEDUP_DIST of each
+            // other are treated as the same character (this is what produced
+            // the "doubled box" — some source lists can carry two live
+            // pointers for one physical target, e.g. a base object plus a
+            // hitbox/proxy) and only the first is kept.
+            const float DEDUP_DIST2 = 0.3f * 0.3f;
+            std::vector<Vector3> accepted;
             for (void* obj : targets) {
                 Vector3 anchor; float headoff, feetoff;
                 if (plh) {
@@ -527,6 +534,14 @@ static void compute_boxes() {
                     if (!obj_pos(obj, anchor)) continue;
                     headoff = g_head_off; feetoff = g_feet_off;
                 }
+                bool dup = false;
+                for (const Vector3& a : accepted) {
+                    float dx = a.x - anchor.x, dy = a.y - anchor.y, dz = a.z - anchor.z;
+                    if (dx*dx + dy*dy + dz*dz < DEDUP_DIST2) { dup = true; break; }
+                }
+                if (dup) continue;
+                accepted.push_back(anchor);
+
                 Vector3 top = anchor; top.y += headoff;
                 Vector3 bot = anchor; bot.y += feetoff;
                 Vector3 sTop = W2S(cam, top, NULL);
@@ -576,16 +591,27 @@ static void render_frame(float screenW, float screenH) {
         rects.push_back(CGRectMake(wp.x, wp.y, ws.x, ws.y));
 
         ImGui::Checkbox("ESP", &g_esp_on); ImGui::SameLine();
+        // BotAI has no known team offset (g_off_team==0) so "enemies only"
+        // is a silent no-op in that mode — grey it out instead of pretending
+        // it works, rather than leave it clickable-but-broken.
+        bool enemiesOnlyUsable = (g_esp_src == 1) || (g_off_team != 0);
+        ImGui::BeginDisabled(!enemiesOnlyUsable);
         ImGui::Checkbox("Enemies only", &g_enemies_only);
+        ImGui::EndDisabled();
+        if (!enemiesOnlyUsable) { ImGui::SameLine(); ImGui::TextDisabled("(no team data in BotAI mode)"); }
         ImGui::RadioButton("PLH players (real)", &g_esp_src, 1); ImGui::SameLine();
         ImGui::RadioButton("FindObjectsOfType", &g_esp_src, 0);
         ImGui::InputInt("Local team", &g_local_team);
         if (g_esp_src == 1) {
             ImGui::SliderFloat("Box top",   &g_pd_head_off, -1.0f, 3.0f);
             ImGui::SliderFloat("Box bottom",&g_pd_feet_off, -3.0f, 1.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset##pd")) { g_pd_head_off = 1.6f; g_pd_feet_off = -0.1f; }
         } else {
             ImGui::SliderFloat("Box top",   &g_head_off, -3.0f, 3.0f);
             ImGui::SliderFloat("Box bottom",&g_feet_off, -3.0f, 3.0f);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset##bot")) { g_head_off = 0.2f; g_feet_off = -1.9f; }
         }
         ImGui::SliderFloat("Box width", &g_width_mult, 0.1f, 1.0f);
 
@@ -597,18 +623,18 @@ static void render_frame(float screenW, float screenH) {
             ImGui::RadioButton("pos: get_transform()", &g_pos_mode, 1);
             ImGui::InputScalar("tf off",   ImGuiDataType_U64, &g_off_tf,   0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
             ImGui::InputScalar("team off", ImGuiDataType_U64, &g_off_team, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            if (ImGui::Button("Apply / Re-resolve")) resolve_all();
+            if (ImGui::Button("Apply / Re-resolve")) g_want_resolve = true;
             ImGui::SameLine();
             if (ImGui::Button("Target = Player")) {
                 strcpy(g_target_cls, "Player"); g_target_ns[0] = 0;
                 g_pos_mode = 1;               // Player: position via get_transform()
-                resolve_all();
+                g_want_resolve = true;
             }
             ImGui::SameLine();
             if (ImGui::Button("Target = BotAI")) {
                 strcpy(g_target_cls, "BotAI"); g_target_ns[0] = 0;
                 g_pos_mode = 0; g_off_tf = 0x20;
-                resolve_all();
+                g_want_resolve = true;
             }
         }
 

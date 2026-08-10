@@ -20,6 +20,13 @@
 #include "imgui.h"
 #include "imgui_impl_metal.h"
 
+// Bump this every release — shown in the always-on load indicator so it's
+// obvious whether the loader actually replaced the running dylib with the
+// latest one, vs a stale cached copy.
+#define BUILD_TAG "diag1"
+
+static double g_overlay_start_time = 0;
+
 struct Vector3 { float x, y, z; };
 
 // Resolved Unity methods (called by address; trailing arg = hidden MethodInfo*)
@@ -990,6 +997,21 @@ static void render_frame(float screenW, float screenH) {
         }
     }
 
+    // Always-visible, self-fading "I loaded" indicator — independent of the
+    // menu/gesture entirely, so a loader-delivered build can be confirmed as
+    // running even if something else (gesture, resolve, network) is broken.
+    // Bump BUILD_TAG per release so it's obvious a NEW dylib is what's active,
+    // not a stale cached one the loader failed to replace.
+    if (g_overlay_start_time > 0) {
+        double elapsed = [NSDate timeIntervalSinceReferenceDate] - g_overlay_start_time;
+        if (elapsed < 15.0) {
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            char buf[96];
+            snprintf(buf, sizeof(buf), "Blockpost ESP loaded [%s] — 3-finger double-tap for menu", BUILD_TAG);
+            draw_outlined_text(dl, ImVec2(10, 10), IM_COL32(120,255,120,255), buf);
+        }
+    }
+
     { std::lock_guard<std::mutex> l(g_rects_mtx); g_capture_rects = rects; }
 }
 
@@ -1081,6 +1103,7 @@ static ESPWindow*   g_window   = nil;
 static ESPRenderer* g_renderer = nil;
 
 static void setup_overlay() {
+    g_overlay_start_time = [NSDate timeIntervalSinceReferenceDate];
     g_prev_step = read_step();   // what the last run reached before dying (if any)
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();

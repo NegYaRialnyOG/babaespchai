@@ -6,6 +6,7 @@
 	<dict>
 		<key>Bundles</key>
 		<array>
+			<string>com.skullcapstudios.bpm</string>
 			<string>com.skullcapstudios.bps</string>
 			<string>com.skullcapstudios.blockpost</string>
 			<string>com.skullcapstudios.blockpostmobile</string>

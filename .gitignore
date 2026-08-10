@@ -1,3 +1,4 @@
 imgui/
 .theos/
 packages/
+*.ipa

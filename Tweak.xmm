@@ -1,13 +1,19 @@
 // Blockpost Mobile 2D Box ESP — NeqYaRialnyOG & Nyx
-// Overlay-based Dear ImGui menu + live-tunable offsets + Copy Debug dump.
-// Rendering is done on our OWN MTKView on top of the game, so we never touch
-// Unity's Metal command buffer (safer on arm64e / PAC).
+// Overlay Dear ImGui menu + il2cpp runtime enumeration of all characters.
+//
+// Rendering is on our OWN MTKView above the game (no hooking Unity's Metal or
+// MSHookFunction -> safe on arm64e). We read game state through the exported
+// il2cpp_* API and by calling a few resolved Unity methods directly.
+//
+// Resolved for BLOCKPOSTMOBILE build 260206 (metadata v31, arm64), image
+// = UnityFramework. All addresses are RVAs relative to that image's header
+// and are live-editable from the debug menu.
 
 #import <UIKit/UIKit.h>
 #import <MetalKit/MetalKit.h>
 #import <Metal/Metal.h>
-#include <substrate.h>
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
 #include <string.h>
 #include <vector>
 #include <mutex>
@@ -17,54 +23,66 @@
 #include "imgui_impl_metal.h"
 
 // ---------------------------------------------------------------------------
-// Unity types
+// Unity math
 // ---------------------------------------------------------------------------
 struct Vector3 { float x, y, z; };
 struct Vector2 { float x, y; };
 
-typedef Vector2 (*WorldToScreenPoint_t)(void* camera, Vector3 worldPoint);
-typedef void*   (*Camera_get_main_t)();
+// il2cpp methods take a trailing hidden `const MethodInfo* method` argument.
+// WorldToScreenPoint_Injected(this, Vector3* worldIn, Vector3* screenOut, method)
+typedef void  (*W2S_Injected_t)(void* camera, Vector3* in, Vector3* out, void* method);
+typedef void* (*Camera_get_main_t)(void* method);
+typedef Vector3 (*Motor_get_TransientPosition_t)(void* motor, void* method);
 
-static WorldToScreenPoint_t WorldToScreenPoint = NULL;
-static Camera_get_main_t    Camera_get_main    = NULL;
-
-// ---------------------------------------------------------------------------
-// Offsets (image-relative). Editable live from the debug menu, then "Apply".
-// These are the current guesses — the whole point of the debug menu is to
-// tune them at runtime and copy the working values back out.
-// ---------------------------------------------------------------------------
-static char        g_image_name[64]   = "UnityFramework"; // image the offsets belong to
-static uintptr_t   g_off_w2s          = 0x3410F44;         // WorldToScreenPoint
-static uintptr_t   g_off_cam          = 0x0;               // Camera.get_main  (unknown -> fill in)
-static uintptr_t   g_off_ongui        = 0x166953C;         // Player.OnGUI
-static uintptr_t   g_off_pos          = 0x24;              // Vector3 world pos in player struct
-static uintptr_t   g_off_team         = 0x0;               // team id in player struct (unknown -> fill in)
-
-static uintptr_t   g_image_base       = 0;                 // resolved base of g_image_name
-static bool        g_esp_on           = true;
-static bool        g_enemies_only     = true;
-static int         g_local_team       = -1;                // set from menu after we identify it
+static W2S_Injected_t                 W2S            = NULL;
+static Camera_get_main_t              Camera_get_main= NULL;
+static Motor_get_TransientPosition_t  Motor_get_TP   = NULL;
 
 // ---------------------------------------------------------------------------
-// Player instances collected each frame from the Player.OnGUI hook.
-// Unity calls OnGUI per-Player component, so we accumulate them and snapshot.
+// il2cpp runtime API (exported by UnityFramework, resolved via dlsym)
 // ---------------------------------------------------------------------------
-static std::mutex               g_mtx;
-static std::vector<uintptr_t>   g_players_pending;   // filled by the hook
-static std::vector<uintptr_t>   g_players_snapshot;  // stable copy used for drawing/debug
+typedef void* (*il2cpp_domain_get_t)();
+typedef void* (*il2cpp_domain_assembly_open_t)(void*, const char*);
+typedef void* (*il2cpp_assembly_get_image_t)(void*);
+typedef void* (*il2cpp_class_from_name_t)(void*, const char*, const char*);
+typedef void* (*il2cpp_class_get_field_from_name_t)(void*, const char*);
+typedef void  (*il2cpp_field_static_get_value_t)(void*, void*);
+typedef void* (*il2cpp_object_get_class_t)(void*);
+typedef const char* (*il2cpp_class_get_name_t)(void*);
+typedef void* (*il2cpp_thread_attach_t)(void*);
 
-static void (*orig_Player_OnGUI)(void* player_instance) = NULL;
-
-void hk_Player_OnGUI(void* player_instance) {
-    orig_Player_OnGUI(player_instance);
-    if (!player_instance) return;
-    std::lock_guard<std::mutex> l(g_mtx);
-    if (g_players_pending.size() < 128)
-        g_players_pending.push_back((uintptr_t)player_instance);
-}
+static il2cpp_domain_get_t                il2cpp_domain_get               = NULL;
+static il2cpp_domain_assembly_open_t      il2cpp_domain_assembly_open     = NULL;
+static il2cpp_assembly_get_image_t        il2cpp_assembly_get_image       = NULL;
+static il2cpp_class_from_name_t           il2cpp_class_from_name          = NULL;
+static il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name= NULL;
+static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value   = NULL;
+static il2cpp_object_get_class_t          il2cpp_object_get_class         = NULL;
+static il2cpp_class_get_name_t            il2cpp_class_get_name           = NULL;
+static il2cpp_thread_attach_t             il2cpp_thread_attach            = NULL;
 
 // ---------------------------------------------------------------------------
-// Image resolution helpers
+// Live-tunable offsets / RVAs (all relative to g_image_base)
+// ---------------------------------------------------------------------------
+static char      g_image_name[64]   = "UnityFramework";
+static uintptr_t g_rva_w2s          = 0x321bed8; // Camera.WorldToScreenPoint_Injected
+static uintptr_t g_rva_getmain      = 0x321c3d4; // Camera.get_main
+static uintptr_t g_rva_tp           = 0x17c93b8; // KinematicCharacterMotor.get_TransientPosition
+static uintptr_t g_off_ctrl         = 0x1B0;     // motor -> CharacterController (ICharacterController)
+static uintptr_t g_off_team         = 0x0;       // team int inside the controller object (TUNE ME)
+static float     g_box_height       = 1.8f;      // world units, feet->head
+
+static uintptr_t g_image_base       = 0;
+static bool      g_esp_on           = true;
+static bool      g_enemies_only     = false;     // needs a valid g_off_team first
+static int       g_local_team       = -1;
+
+// il2cpp handles (resolved once, refreshed on Apply)
+static void* g_kcs_class = NULL;   // KinematicCharacterSystem
+static void* g_motors_field = NULL;// static List<KinematicCharacterMotor> CharacterMotors
+
+static std::string g_debug_text;
+
 // ---------------------------------------------------------------------------
 static uintptr_t image_header_for(const char* needle) {
     uint32_t count = _dyld_image_count();
@@ -76,194 +94,194 @@ static uintptr_t image_header_for(const char* needle) {
     return 0;
 }
 
-static void resolve_pointers() {
+static void resolve_il2cpp_api() {
+    il2cpp_domain_get                = (il2cpp_domain_get_t)dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
+    il2cpp_domain_assembly_open      = (il2cpp_domain_assembly_open_t)dlsym(RTLD_DEFAULT, "il2cpp_domain_assembly_open");
+    il2cpp_assembly_get_image        = (il2cpp_assembly_get_image_t)dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
+    il2cpp_class_from_name           = (il2cpp_class_from_name_t)dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
+    il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t)dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
+    il2cpp_field_static_get_value    = (il2cpp_field_static_get_value_t)dlsym(RTLD_DEFAULT, "il2cpp_field_static_get_value");
+    il2cpp_object_get_class          = (il2cpp_object_get_class_t)dlsym(RTLD_DEFAULT, "il2cpp_object_get_class");
+    il2cpp_class_get_name            = (il2cpp_class_get_name_t)dlsym(RTLD_DEFAULT, "il2cpp_class_get_name");
+    il2cpp_thread_attach             = (il2cpp_thread_attach_t)dlsym(RTLD_DEFAULT, "il2cpp_thread_attach");
+}
+
+static void resolve_all() {
     g_image_base = image_header_for(g_image_name);
-    if (!g_image_base) g_image_base = (uintptr_t)_dyld_get_image_header(0); // fallback: main exe
+    if (!g_image_base) g_image_base = (uintptr_t)_dyld_get_image_header(0);
 
-    WorldToScreenPoint = g_off_w2s   ? (WorldToScreenPoint_t)(g_image_base + g_off_w2s)   : NULL;
-    Camera_get_main    = g_off_cam   ? (Camera_get_main_t)(g_image_base + g_off_cam)      : NULL;
+    W2S             = g_rva_w2s     ? (W2S_Injected_t)(g_image_base + g_rva_w2s)                : NULL;
+    Camera_get_main = g_rva_getmain ? (Camera_get_main_t)(g_image_base + g_rva_getmain)         : NULL;
+    Motor_get_TP    = g_rva_tp      ? (Motor_get_TransientPosition_t)(g_image_base + g_rva_tp)  : NULL;
 
-    if (g_off_ongui) {
-        void* target = (void*)(g_image_base + g_off_ongui);
-        if (orig_Player_OnGUI == NULL)
-            MSHookFunction(target, (void*)&hk_Player_OnGUI, (void**)&orig_Player_OnGUI);
+    // resolve the static motor list via runtime API
+    g_kcs_class = NULL; g_motors_field = NULL;
+    if (il2cpp_domain_get && il2cpp_class_from_name) {
+        void* dom = il2cpp_domain_get();
+        void* asmb = il2cpp_domain_assembly_open ? il2cpp_domain_assembly_open(dom, "Assembly-CSharp") : NULL;
+        void* img = asmb && il2cpp_assembly_get_image ? il2cpp_assembly_get_image(asmb) : NULL;
+        if (img) {
+            g_kcs_class = il2cpp_class_from_name(img, "KinematicCharacterController", "KinematicCharacterSystem");
+            if (g_kcs_class && il2cpp_class_get_field_from_name)
+                g_motors_field = il2cpp_class_get_field_from_name(g_kcs_class, "CharacterMotors");
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Touch capture rects — only these regions steal touches from the game.
-// Everything else passes straight through so the game stays playable.
-// ---------------------------------------------------------------------------
-static std::mutex            g_rects_mtx;
-static std::vector<CGRect>   g_capture_rects;
+// Snapshot the current motor list into a plain vector of pointers.
+static int get_motors(std::vector<void*>& out) {
+    out.clear();
+    if (!g_motors_field || !il2cpp_field_static_get_value) return 0;
+    void* listobj = NULL;
+    il2cpp_field_static_get_value(g_motors_field, &listobj); // static -> obj ignored
+    if (!listobj) return 0;
+    // System.Collections.Generic.List<T>: _items @0x10 (T[]), _size @0x18 (int)
+    void* items = *(void**)((char*)listobj + 0x10);
+    int size    = *(int*) ((char*)listobj + 0x18);
+    if (!items || size <= 0 || size > 512) return 0;
+    // Il2CppArray payload begins at 0x20
+    for (int i = 0; i < size; i++) {
+        void* m = *(void**)((char*)items + 0x20 + (uintptr_t)i * 8);
+        if (m) out.push_back(m);
+    }
+    return (int)out.size();
+}
+
+static int motor_team(void* motor) {
+    if (!g_off_team) return -999;
+    void* ctrl = *(void**)((char*)motor + g_off_ctrl);
+    if (!ctrl) return -999;
+    return *(int*)((char*)ctrl + g_off_team);
+}
 
 // ---------------------------------------------------------------------------
-// Debug dump text (built each frame, copied to clipboard on demand)
-// ---------------------------------------------------------------------------
-static std::string g_debug_text;
-
 static std::string build_debug_dump() {
-    char buf[4096];
-    std::string out;
+    char b[512];
+    std::string o;
+    snprintf(b, sizeof(b), "=== Blockpost ESP debug ===\nimage=%s base=0x%lx\n"
+             "rva_w2s=0x%lx rva_getmain=0x%lx rva_tp=0x%lx off_ctrl=0x%lx off_team=0x%lx\n",
+             g_image_name, (unsigned long)g_image_base,
+             (unsigned long)g_rva_w2s, (unsigned long)g_rva_getmain, (unsigned long)g_rva_tp,
+             (unsigned long)g_off_ctrl, (unsigned long)g_off_team);
+    o += b;
+    snprintf(b, sizeof(b), "il2cpp api: dom=%p class=%p field=%p\n",
+             (void*)il2cpp_domain_get, g_kcs_class, g_motors_field); o += b;
 
-    snprintf(buf, sizeof(buf),
-        "=== Blockpost ESP debug ===\n"
-        "image: %s  base=0x%lx\n"
-        "off_w2s=0x%lx  off_cam=0x%lx  off_ongui=0x%lx  off_pos=0x%lx  off_team=0x%lx\n"
-        "abs W2S=%p  abs Camera.main=%p  abs OnGUI=0x%lx\n",
-        g_image_name, (unsigned long)g_image_base,
-        (unsigned long)g_off_w2s, (unsigned long)g_off_cam, (unsigned long)g_off_ongui,
-        (unsigned long)g_off_pos, (unsigned long)g_off_team,
-        (void*)WorldToScreenPoint, (void*)Camera_get_main,
-        (unsigned long)(g_image_base + g_off_ongui));
-    out += buf;
+    void* cam = Camera_get_main ? Camera_get_main(NULL) : NULL;
+    snprintf(b, sizeof(b), "camera=%p\n", cam); o += b;
 
-    void* cam = Camera_get_main ? Camera_get_main() : NULL;
-    snprintf(buf, sizeof(buf), "camera ptr = %p\nplayers this frame = %d\n",
-             cam, (int)g_players_snapshot.size());
-    out += buf;
+    std::vector<void*> motors; int n = get_motors(motors);
+    snprintf(b, sizeof(b), "motors=%d\n", n); o += b;
 
-    // list loaded images that look relevant (helps me pick the right base)
-    out += "-- images (Unity/Blockpost) --\n";
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char* n = _dyld_get_image_name(i);
-        if (!n) continue;
-        if (strstr(n, "Unity") || strstr(n, "blockpost") || strstr(n, "Blockpost") || strstr(n, "bps")) {
-            snprintf(buf, sizeof(buf), "  [%u] base=%p  %s\n",
-                     i, _dyld_get_image_header(i), n);
-            out += buf;
+    // dump up to 4 characters: controller class name + first 0x80 bytes so we
+    // can locate the team field, plus position + screen projection
+    for (int i = 0; i < n && i < 4; i++) {
+        void* m = motors[i];
+        void* ctrl = *(void**)((char*)m + g_off_ctrl);
+        const char* cname = "?";
+        if (ctrl && il2cpp_object_get_class && il2cpp_class_get_name) {
+            void* c = il2cpp_object_get_class(ctrl);
+            if (c) cname = il2cpp_class_get_name(c);
         }
-    }
+        snprintf(b, sizeof(b), "-- motor[%d]=%p ctrl=%p (%s) --\n", i, m, ctrl, cname); o += b;
 
-    // hexdump the first player struct so I can locate pos/team fields
-    if (!g_players_snapshot.empty()) {
-        uintptr_t p = g_players_snapshot[0];
-        snprintf(buf, sizeof(buf), "-- player[0] @ 0x%lx (first 0x120 bytes) --\n", (unsigned long)p);
-        out += buf;
-        unsigned char* bytes = (unsigned char*)p;
-        for (int row = 0; row < 0x120; row += 16) {
-            snprintf(buf, sizeof(buf), "  +0x%03x: ", row);
-            out += buf;
-            for (int c = 0; c < 16; c++) {
-                snprintf(buf, sizeof(buf), "%02x ", bytes[row + c]);
-                out += buf;
+        if (Motor_get_TP) {
+            Vector3 p = Motor_get_TP(m, NULL);
+            snprintf(b, sizeof(b), "   pos=(%.2f,%.2f,%.2f)", p.x, p.y, p.z); o += b;
+            if (cam && W2S) {
+                Vector3 s; W2S(cam, &p, &s, NULL);
+                snprintf(b, sizeof(b), "  screen=(%.1f,%.1f,z=%.2f)", s.x, s.y, s.z); o += b;
             }
-            // interpret the 4 bytes at this row as a float (helps spot coords)
-            float f = *(float*)(bytes + row);
-            snprintf(buf, sizeof(buf), "  f=%.3f\n", f);
-            out += buf;
+            o += "\n";
         }
-
-        Vector3 pos = *(Vector3*)(p + g_off_pos);
-        snprintf(buf, sizeof(buf), "player[0] pos = (%.2f, %.2f, %.2f)\n", pos.x, pos.y, pos.z);
-        out += buf;
-        if (cam && WorldToScreenPoint) {
-            Vector2 s = WorldToScreenPoint(cam, pos);
-            snprintf(buf, sizeof(buf), "player[0] W2S = (%.2f, %.2f)\n", s.x, s.y);
-            out += buf;
-        }
-        if (g_off_team) {
-            int team = *(int*)(p + g_off_team);
-            snprintf(buf, sizeof(buf), "player[0] team = %d\n", team);
-            out += buf;
+        if (ctrl) {
+            unsigned char* bytes = (unsigned char*)ctrl;
+            for (int row = 0; row < 0x80; row += 16) {
+                snprintf(b, sizeof(b), "   +0x%02x: ", row); o += b;
+                for (int c = 0; c < 16; c++) { snprintf(b, sizeof(b), "%02x ", bytes[row+c]); o += b; }
+                snprintf(b, sizeof(b), " i0=%d f0=%.2f\n",
+                         *(int*)(bytes+row), *(float*)(bytes+row)); o += b;
+            }
         }
     }
-    return out;
+    return o;
 }
 
 // ---------------------------------------------------------------------------
-// ImGui frame: menu (touchable) + ESP boxes (pass-through foreground draw)
+// Touch capture rects
+// ---------------------------------------------------------------------------
+static std::mutex          g_rects_mtx;
+static std::vector<CGRect> g_capture_rects;
+
 // ---------------------------------------------------------------------------
 static void render_frame(float screenW, float screenH) {
-    // snapshot players collected since last frame
-    {
-        std::lock_guard<std::mutex> l(g_mtx);
-        if (!g_players_pending.empty()) {
-            g_players_snapshot = g_players_pending;
-            g_players_pending.clear();
-        }
-    }
-
     std::vector<CGRect> rects;
 
-    // ---- menu window ----
-    ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(30, 80), ImGuiCond_FirstUseEver);
     ImGui::Begin("Blockpost ESP [debug]");
     {
-        ImVec2 wp = ImGui::GetWindowPos();
-        ImVec2 ws = ImGui::GetWindowSize();
+        ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         rects.push_back(CGRectMake(wp.x, wp.y, ws.x, ws.y));
 
-        ImGui::Checkbox("ESP", &g_esp_on);
-        ImGui::SameLine();
+        ImGui::Checkbox("ESP", &g_esp_on); ImGui::SameLine();
         ImGui::Checkbox("Enemies only", &g_enemies_only);
         ImGui::InputInt("Local team", &g_local_team);
+        ImGui::SliderFloat("Box height", &g_box_height, 0.5f, 3.0f);
 
-        ImGui::SeparatorText("Offsets (image-relative, hex)");
+        ImGui::SeparatorText("Offsets (hex, image-relative)");
         ImGui::InputText("image", g_image_name, sizeof(g_image_name));
-        ImGui::InputScalar("off W2S",   ImGuiDataType_U64, &g_off_w2s,   NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::InputScalar("off Camera",ImGuiDataType_U64, &g_off_cam,   NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::InputScalar("off OnGUI", ImGuiDataType_U64, &g_off_ongui, NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::InputScalar("off pos",   ImGuiDataType_U64, &g_off_pos,   NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        ImGui::InputScalar("off team",  ImGuiDataType_U64, &g_off_team,  NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
-        if (ImGui::Button("Apply / Re-resolve")) resolve_pointers();
+        ImGui::InputScalar("W2S",     ImGuiDataType_U64, &g_rva_w2s,     0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("get_main",ImGuiDataType_U64, &g_rva_getmain, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("TransPos",ImGuiDataType_U64, &g_rva_tp,      0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("ctrl off",ImGuiDataType_U64, &g_off_ctrl,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("team off",ImGuiDataType_U64, &g_off_team,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        if (ImGui::Button("Apply / Re-resolve")) resolve_all();
 
         ImGui::SeparatorText("State");
-        ImGui::Text("base = 0x%lx", (unsigned long)g_image_base);
-        void* cam = Camera_get_main ? Camera_get_main() : NULL;
-        ImGui::Text("camera = %p", cam);
-        ImGui::Text("players = %d", (int)g_players_snapshot.size());
+        void* cam = Camera_get_main ? Camera_get_main(NULL) : NULL;
+        std::vector<void*> motors; int n = get_motors(motors);
+        ImGui::Text("base=0x%lx  cam=%p", (unsigned long)g_image_base, cam);
+        ImGui::Text("motors=%d  class=%p field=%p", n, g_kcs_class, g_motors_field);
 
         g_debug_text = build_debug_dump();
         if (ImGui::Button("Copy Debug")) {
-            NSString* s = [NSString stringWithUTF8String:g_debug_text.c_str()];
-            [UIPasteboard generalPasteboard].string = s;
+            [UIPasteboard generalPasteboard].string =
+                [NSString stringWithUTF8String:g_debug_text.c_str()];
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("(-> paste to Nyx)");
+        ImGui::SameLine(); ImGui::TextDisabled("(-> paste to Nyx)");
     }
     ImGui::End();
 
-    // ---- ESP boxes on the foreground (do NOT capture touches) ----
-    if (g_esp_on && WorldToScreenPoint) {
-        void* cam = Camera_get_main ? Camera_get_main() : NULL;
+    // ---- ESP boxes ----
+    if (g_esp_on && W2S && Camera_get_main && Motor_get_TP) {
+        void* cam = Camera_get_main(NULL);
         if (cam) {
+            std::vector<void*> motors; get_motors(motors);
             ImDrawList* dl = ImGui::GetForegroundDrawList();
-            std::vector<uintptr_t> snap;
-            { std::lock_guard<std::mutex> l(g_mtx); snap = g_players_snapshot; }
-
-            for (uintptr_t p : snap) {
-                if (!p) continue;
-
+            for (void* m : motors) {
                 if (g_enemies_only && g_off_team && g_local_team >= 0) {
-                    int team = *(int*)(p + g_off_team);
-                    if (team == g_local_team) continue; // skip teammates
+                    int t = motor_team(m);
+                    if (t == g_local_team) continue;
                 }
+                Vector3 feet = Motor_get_TP(m, NULL);
+                Vector3 head = feet; head.y += g_box_height;
 
-                Vector3 feet = *(Vector3*)(p + g_off_pos);
-                Vector2 sf = WorldToScreenPoint(cam, feet);
-                if (sf.z <= 0.0f && sf.x == 0.0f && sf.y == 0.0f) continue;
+                Vector3 sf, sh;
+                W2S(cam, &feet, &sf, NULL);
+                W2S(cam, &head, &sh, NULL);
+                if (sf.z <= 0.0f) continue; // behind camera
 
-                // head ~= feet + 1.8 world units up
-                Vector3 head = feet; head.y += 1.8f;
-                Vector2 sh = WorldToScreenPoint(cam, head);
-
-                // Unity screen origin is bottom-left; flip Y to UIKit top-left.
-                float feetY = screenH - sf.y;
+                float feetY = screenH - sf.y;   // Unity origin bottom-left -> UIKit top-left
                 float headY = screenH - sh.y;
-                if (sf.x <= 0 || sf.x >= screenW) continue;
-                if (feetY <= 0 || feetY >= screenH) continue;
-
-                float h = feetY - headY; if (h < 4) h = 4;
-                float w = h * 0.45f;
                 float cx = sf.x;
-                ImVec2 tl(cx - w * 0.5f, headY);
-                ImVec2 br(cx + w * 0.5f, feetY);
-                dl->AddRect(tl, br, IM_COL32(255, 30, 30, 255), 0.0f, 0, 2.0f);
-                dl->AddRect(ImVec2(tl.x - 1, tl.y - 1), ImVec2(br.x + 1, br.y + 1),
-                            IM_COL32(0, 0, 0, 160), 0.0f, 0, 1.0f); // outline for contrast
+                if (cx <= 0 || cx >= screenW) continue;
+
+                float h = feetY - headY; if (h < 6) h = 6;
+                float w = h * 0.45f;
+                ImVec2 tl(cx - w * 0.5f, headY), br(cx + w * 0.5f, feetY);
+                dl->AddRect(ImVec2(tl.x-1,tl.y-1), ImVec2(br.x+1,br.y+1), IM_COL32(0,0,0,180), 0,0,3.0f);
+                dl->AddRect(tl, br, IM_COL32(255,40,40,255), 0,0,1.5f);
             }
         }
     }
@@ -272,11 +290,10 @@ static void render_frame(float screenW, float screenH) {
 }
 
 // ---------------------------------------------------------------------------
-// Metal overlay view + renderer
+// Metal overlay
 // ---------------------------------------------------------------------------
 @interface ESPView : MTKView
 @end
-
 @implementation ESPView
 - (void)feedTouch:(UITouch*)t down:(int)state {
     CGPoint p = [t locationInView:self];
@@ -284,28 +301,25 @@ static void render_frame(float screenW, float screenH) {
     io.AddMousePosEvent(p.x, p.y);
     if (state >= 0) io.AddMouseButtonEvent(0, state == 1);
 }
-- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)e { [self feedTouch:touches.anyObject down:1]; }
-- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)e { [self feedTouch:touches.anyObject down:-1]; }
-- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)e { [self feedTouch:touches.anyObject down:0]; }
-- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)e { [self feedTouch:touches.anyObject down:0]; }
+- (void)touchesBegan:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e { [self feedTouch:t.anyObject down:1]; }
+- (void)touchesMoved:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e { [self feedTouch:t.anyObject down:-1]; }
+- (void)touchesEnded:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e { [self feedTouch:t.anyObject down:0]; }
+- (void)touchesCancelled:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e { [self feedTouch:t.anyObject down:0]; }
 @end
 
 @interface ESPRenderer : NSObject <MTKViewDelegate>
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
 @end
-
 @implementation ESPRenderer
-- (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {}
+- (void)mtkView:(MTKView*)v drawableSizeWillChange:(CGSize)s {}
 - (void)drawInMTKView:(MTKView*)view {
     id<MTLCommandBuffer> cb = [self.queue commandBuffer];
     MTLRenderPassDescriptor* rpd = view.currentRenderPassDescriptor;
     if (!rpd) { [cb commit]; return; }
-
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
     io.DisplayFramebufferScale = ImVec2(view.contentScaleFactor, view.contentScaleFactor);
     io.DeltaTime = 1.0f / 60.0f;
-
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
     ImGui_ImplMetal_NewFrame(rpd);
     ImGui::NewFrame();
@@ -313,26 +327,19 @@ static void render_frame(float screenW, float screenH) {
     ImGui::Render();
     ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
     [enc endEncoding];
-
     if (view.currentDrawable) [cb presentDrawable:view.currentDrawable];
     [cb commit];
 }
 @end
 
-// ---------------------------------------------------------------------------
-// Overlay window: pass-through except inside capture rects
-// ---------------------------------------------------------------------------
 @interface ESPWindow : UIWindow
 @end
-
 @implementation ESPWindow
 - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
     std::lock_guard<std::mutex> l(g_rects_mtx);
-    for (const CGRect& r : g_capture_rects) {
-        if (CGRectContainsPoint(r, point))
-            return [super hitTest:point withEvent:event];
-    }
-    return nil; // let the game have the touch
+    for (const CGRect& r : g_capture_rects)
+        if (CGRectContainsPoint(r, point)) return [super hitTest:point withEvent:event];
+    return nil;
 }
 @end
 
@@ -342,52 +349,48 @@ static ESPRenderer* g_renderer = nil;
 static void setup_overlay() {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return;
-
     CGRect frame = [UIScreen mainScreen].bounds;
+
     g_window = [[ESPWindow alloc] initWithFrame:frame];
     g_window.windowLevel = UIWindowLevelStatusBar + 1000;
     g_window.backgroundColor = [UIColor clearColor];
     g_window.opaque = NO;
-    g_window.userInteractionEnabled = YES;
 
     UIViewController* vc = [UIViewController new];
     g_window.rootViewController = vc;
 
-    ESPView* mtkView = [[ESPView alloc] initWithFrame:frame device:device];
-    mtkView.backgroundColor = [UIColor clearColor];
-    mtkView.opaque = NO;
-    mtkView.layer.opaque = NO;
-    mtkView.clearColor = MTLClearColorMake(0, 0, 0, 0);
-    mtkView.framebufferOnly = NO;
-    mtkView.enableSetNeedsDisplay = NO;
-    mtkView.paused = NO;
-    mtkView.preferredFramesPerSecond = 60;
-    mtkView.multipleTouchEnabled = YES;
-    vc.view = mtkView;
+    ESPView* mtk = [[ESPView alloc] initWithFrame:frame device:device];
+    mtk.backgroundColor = [UIColor clearColor];
+    mtk.opaque = NO; mtk.layer.opaque = NO;
+    mtk.clearColor = MTLClearColorMake(0,0,0,0);
+    mtk.framebufferOnly = NO;
+    mtk.enableSetNeedsDisplay = NO; mtk.paused = NO;
+    mtk.preferredFramesPerSecond = 60;
+    mtk.multipleTouchEnabled = YES;
+    vc.view = mtk;
 
-    // ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = NULL;
-    io.FontGlobalScale = 2.0f;     // readable on a phone screen
+    io.FontGlobalScale = 2.0f;
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(2.0f);
     ImGui_ImplMetal_Init(device);
 
     g_renderer = [ESPRenderer new];
     g_renderer.queue = [device newCommandQueue];
-    mtkView.delegate = g_renderer;
-
+    mtk.delegate = g_renderer;
     [g_window makeKeyAndVisible];
 }
 
 // ---------------------------------------------------------------------------
 %ctor {
-    resolve_pointers();
-    // build the overlay a bit after launch so the app's UI exists first
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+    resolve_il2cpp_api();
+    // give il2cpp + the app UI time to come up before we resolve/overlay
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        resolve_all();
         setup_overlay();
     });
 }

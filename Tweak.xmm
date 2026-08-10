@@ -1,0 +1,393 @@
+// Blockpost Mobile 2D Box ESP — NeqYaRialnyOG & Nyx
+// Overlay-based Dear ImGui menu + live-tunable offsets + Copy Debug dump.
+// Rendering is done on our OWN MTKView on top of the game, so we never touch
+// Unity's Metal command buffer (safer on arm64e / PAC).
+
+#import <UIKit/UIKit.h>
+#import <MetalKit/MetalKit.h>
+#import <Metal/Metal.h>
+#include <substrate.h>
+#include <mach-o/dyld.h>
+#include <string.h>
+#include <vector>
+#include <mutex>
+#include <string>
+
+#include "imgui.h"
+#include "imgui_impl_metal.h"
+
+// ---------------------------------------------------------------------------
+// Unity types
+// ---------------------------------------------------------------------------
+struct Vector3 { float x, y, z; };
+struct Vector2 { float x, y; };
+
+typedef Vector2 (*WorldToScreenPoint_t)(void* camera, Vector3 worldPoint);
+typedef void*   (*Camera_get_main_t)();
+
+static WorldToScreenPoint_t WorldToScreenPoint = NULL;
+static Camera_get_main_t    Camera_get_main    = NULL;
+
+// ---------------------------------------------------------------------------
+// Offsets (image-relative). Editable live from the debug menu, then "Apply".
+// These are the current guesses — the whole point of the debug menu is to
+// tune them at runtime and copy the working values back out.
+// ---------------------------------------------------------------------------
+static char        g_image_name[64]   = "UnityFramework"; // image the offsets belong to
+static uintptr_t   g_off_w2s          = 0x3410F44;         // WorldToScreenPoint
+static uintptr_t   g_off_cam          = 0x0;               // Camera.get_main  (unknown -> fill in)
+static uintptr_t   g_off_ongui        = 0x166953C;         // Player.OnGUI
+static uintptr_t   g_off_pos          = 0x24;              // Vector3 world pos in player struct
+static uintptr_t   g_off_team         = 0x0;               // team id in player struct (unknown -> fill in)
+
+static uintptr_t   g_image_base       = 0;                 // resolved base of g_image_name
+static bool        g_esp_on           = true;
+static bool        g_enemies_only     = true;
+static int         g_local_team       = -1;                // set from menu after we identify it
+
+// ---------------------------------------------------------------------------
+// Player instances collected each frame from the Player.OnGUI hook.
+// Unity calls OnGUI per-Player component, so we accumulate them and snapshot.
+// ---------------------------------------------------------------------------
+static std::mutex               g_mtx;
+static std::vector<uintptr_t>   g_players_pending;   // filled by the hook
+static std::vector<uintptr_t>   g_players_snapshot;  // stable copy used for drawing/debug
+
+static void (*orig_Player_OnGUI)(void* player_instance) = NULL;
+
+void hk_Player_OnGUI(void* player_instance) {
+    orig_Player_OnGUI(player_instance);
+    if (!player_instance) return;
+    std::lock_guard<std::mutex> l(g_mtx);
+    if (g_players_pending.size() < 128)
+        g_players_pending.push_back((uintptr_t)player_instance);
+}
+
+// ---------------------------------------------------------------------------
+// Image resolution helpers
+// ---------------------------------------------------------------------------
+static uintptr_t image_header_for(const char* needle) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char* n = _dyld_get_image_name(i);
+        if (n && needle && strstr(n, needle))
+            return (uintptr_t)_dyld_get_image_header(i);
+    }
+    return 0;
+}
+
+static void resolve_pointers() {
+    g_image_base = image_header_for(g_image_name);
+    if (!g_image_base) g_image_base = (uintptr_t)_dyld_get_image_header(0); // fallback: main exe
+
+    WorldToScreenPoint = g_off_w2s   ? (WorldToScreenPoint_t)(g_image_base + g_off_w2s)   : NULL;
+    Camera_get_main    = g_off_cam   ? (Camera_get_main_t)(g_image_base + g_off_cam)      : NULL;
+
+    if (g_off_ongui) {
+        void* target = (void*)(g_image_base + g_off_ongui);
+        if (orig_Player_OnGUI == NULL)
+            MSHookFunction(target, (void*)&hk_Player_OnGUI, (void**)&orig_Player_OnGUI);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Touch capture rects — only these regions steal touches from the game.
+// Everything else passes straight through so the game stays playable.
+// ---------------------------------------------------------------------------
+static std::mutex            g_rects_mtx;
+static std::vector<CGRect>   g_capture_rects;
+
+// ---------------------------------------------------------------------------
+// Debug dump text (built each frame, copied to clipboard on demand)
+// ---------------------------------------------------------------------------
+static std::string g_debug_text;
+
+static std::string build_debug_dump() {
+    char buf[4096];
+    std::string out;
+
+    snprintf(buf, sizeof(buf),
+        "=== Blockpost ESP debug ===\n"
+        "image: %s  base=0x%lx\n"
+        "off_w2s=0x%lx  off_cam=0x%lx  off_ongui=0x%lx  off_pos=0x%lx  off_team=0x%lx\n"
+        "abs W2S=%p  abs Camera.main=%p  abs OnGUI=0x%lx\n",
+        g_image_name, (unsigned long)g_image_base,
+        (unsigned long)g_off_w2s, (unsigned long)g_off_cam, (unsigned long)g_off_ongui,
+        (unsigned long)g_off_pos, (unsigned long)g_off_team,
+        (void*)WorldToScreenPoint, (void*)Camera_get_main,
+        (unsigned long)(g_image_base + g_off_ongui));
+    out += buf;
+
+    void* cam = Camera_get_main ? Camera_get_main() : NULL;
+    snprintf(buf, sizeof(buf), "camera ptr = %p\nplayers this frame = %d\n",
+             cam, (int)g_players_snapshot.size());
+    out += buf;
+
+    // list loaded images that look relevant (helps me pick the right base)
+    out += "-- images (Unity/Blockpost) --\n";
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char* n = _dyld_get_image_name(i);
+        if (!n) continue;
+        if (strstr(n, "Unity") || strstr(n, "blockpost") || strstr(n, "Blockpost") || strstr(n, "bps")) {
+            snprintf(buf, sizeof(buf), "  [%u] base=%p  %s\n",
+                     i, _dyld_get_image_header(i), n);
+            out += buf;
+        }
+    }
+
+    // hexdump the first player struct so I can locate pos/team fields
+    if (!g_players_snapshot.empty()) {
+        uintptr_t p = g_players_snapshot[0];
+        snprintf(buf, sizeof(buf), "-- player[0] @ 0x%lx (first 0x120 bytes) --\n", (unsigned long)p);
+        out += buf;
+        unsigned char* bytes = (unsigned char*)p;
+        for (int row = 0; row < 0x120; row += 16) {
+            snprintf(buf, sizeof(buf), "  +0x%03x: ", row);
+            out += buf;
+            for (int c = 0; c < 16; c++) {
+                snprintf(buf, sizeof(buf), "%02x ", bytes[row + c]);
+                out += buf;
+            }
+            // interpret the 4 bytes at this row as a float (helps spot coords)
+            float f = *(float*)(bytes + row);
+            snprintf(buf, sizeof(buf), "  f=%.3f\n", f);
+            out += buf;
+        }
+
+        Vector3 pos = *(Vector3*)(p + g_off_pos);
+        snprintf(buf, sizeof(buf), "player[0] pos = (%.2f, %.2f, %.2f)\n", pos.x, pos.y, pos.z);
+        out += buf;
+        if (cam && WorldToScreenPoint) {
+            Vector2 s = WorldToScreenPoint(cam, pos);
+            snprintf(buf, sizeof(buf), "player[0] W2S = (%.2f, %.2f)\n", s.x, s.y);
+            out += buf;
+        }
+        if (g_off_team) {
+            int team = *(int*)(p + g_off_team);
+            snprintf(buf, sizeof(buf), "player[0] team = %d\n", team);
+            out += buf;
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// ImGui frame: menu (touchable) + ESP boxes (pass-through foreground draw)
+// ---------------------------------------------------------------------------
+static void render_frame(float screenW, float screenH) {
+    // snapshot players collected since last frame
+    {
+        std::lock_guard<std::mutex> l(g_mtx);
+        if (!g_players_pending.empty()) {
+            g_players_snapshot = g_players_pending;
+            g_players_pending.clear();
+        }
+    }
+
+    std::vector<CGRect> rects;
+
+    // ---- menu window ----
+    ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(30, 80), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Blockpost ESP [debug]");
+    {
+        ImVec2 wp = ImGui::GetWindowPos();
+        ImVec2 ws = ImGui::GetWindowSize();
+        rects.push_back(CGRectMake(wp.x, wp.y, ws.x, ws.y));
+
+        ImGui::Checkbox("ESP", &g_esp_on);
+        ImGui::SameLine();
+        ImGui::Checkbox("Enemies only", &g_enemies_only);
+        ImGui::InputInt("Local team", &g_local_team);
+
+        ImGui::SeparatorText("Offsets (image-relative, hex)");
+        ImGui::InputText("image", g_image_name, sizeof(g_image_name));
+        ImGui::InputScalar("off W2S",   ImGuiDataType_U64, &g_off_w2s,   NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("off Camera",ImGuiDataType_U64, &g_off_cam,   NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("off OnGUI", ImGuiDataType_U64, &g_off_ongui, NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("off pos",   ImGuiDataType_U64, &g_off_pos,   NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("off team",  ImGuiDataType_U64, &g_off_team,  NULL, NULL, "%lx", ImGuiInputTextFlags_CharsHexadecimal);
+        if (ImGui::Button("Apply / Re-resolve")) resolve_pointers();
+
+        ImGui::SeparatorText("State");
+        ImGui::Text("base = 0x%lx", (unsigned long)g_image_base);
+        void* cam = Camera_get_main ? Camera_get_main() : NULL;
+        ImGui::Text("camera = %p", cam);
+        ImGui::Text("players = %d", (int)g_players_snapshot.size());
+
+        g_debug_text = build_debug_dump();
+        if (ImGui::Button("Copy Debug")) {
+            NSString* s = [NSString stringWithUTF8String:g_debug_text.c_str()];
+            [UIPasteboard generalPasteboard].string = s;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(-> paste to Nyx)");
+    }
+    ImGui::End();
+
+    // ---- ESP boxes on the foreground (do NOT capture touches) ----
+    if (g_esp_on && WorldToScreenPoint) {
+        void* cam = Camera_get_main ? Camera_get_main() : NULL;
+        if (cam) {
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            std::vector<uintptr_t> snap;
+            { std::lock_guard<std::mutex> l(g_mtx); snap = g_players_snapshot; }
+
+            for (uintptr_t p : snap) {
+                if (!p) continue;
+
+                if (g_enemies_only && g_off_team && g_local_team >= 0) {
+                    int team = *(int*)(p + g_off_team);
+                    if (team == g_local_team) continue; // skip teammates
+                }
+
+                Vector3 feet = *(Vector3*)(p + g_off_pos);
+                Vector2 sf = WorldToScreenPoint(cam, feet);
+                if (sf.z <= 0.0f && sf.x == 0.0f && sf.y == 0.0f) continue;
+
+                // head ~= feet + 1.8 world units up
+                Vector3 head = feet; head.y += 1.8f;
+                Vector2 sh = WorldToScreenPoint(cam, head);
+
+                // Unity screen origin is bottom-left; flip Y to UIKit top-left.
+                float feetY = screenH - sf.y;
+                float headY = screenH - sh.y;
+                if (sf.x <= 0 || sf.x >= screenW) continue;
+                if (feetY <= 0 || feetY >= screenH) continue;
+
+                float h = feetY - headY; if (h < 4) h = 4;
+                float w = h * 0.45f;
+                float cx = sf.x;
+                ImVec2 tl(cx - w * 0.5f, headY);
+                ImVec2 br(cx + w * 0.5f, feetY);
+                dl->AddRect(tl, br, IM_COL32(255, 30, 30, 255), 0.0f, 0, 2.0f);
+                dl->AddRect(ImVec2(tl.x - 1, tl.y - 1), ImVec2(br.x + 1, br.y + 1),
+                            IM_COL32(0, 0, 0, 160), 0.0f, 0, 1.0f); // outline for contrast
+            }
+        }
+    }
+
+    { std::lock_guard<std::mutex> l(g_rects_mtx); g_capture_rects = rects; }
+}
+
+// ---------------------------------------------------------------------------
+// Metal overlay view + renderer
+// ---------------------------------------------------------------------------
+@interface ESPView : MTKView
+@end
+
+@implementation ESPView
+- (void)feedTouch:(UITouch*)t down:(int)state {
+    CGPoint p = [t locationInView:self];
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(p.x, p.y);
+    if (state >= 0) io.AddMouseButtonEvent(0, state == 1);
+}
+- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)e { [self feedTouch:touches.anyObject down:1]; }
+- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)e { [self feedTouch:touches.anyObject down:-1]; }
+- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)e { [self feedTouch:touches.anyObject down:0]; }
+- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)e { [self feedTouch:touches.anyObject down:0]; }
+@end
+
+@interface ESPRenderer : NSObject <MTKViewDelegate>
+@property (nonatomic, strong) id<MTLCommandQueue> queue;
+@end
+
+@implementation ESPRenderer
+- (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {}
+- (void)drawInMTKView:(MTKView*)view {
+    id<MTLCommandBuffer> cb = [self.queue commandBuffer];
+    MTLRenderPassDescriptor* rpd = view.currentRenderPassDescriptor;
+    if (!rpd) { [cb commit]; return; }
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
+    io.DisplayFramebufferScale = ImVec2(view.contentScaleFactor, view.contentScaleFactor);
+    io.DeltaTime = 1.0f / 60.0f;
+
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+    ImGui_ImplMetal_NewFrame(rpd);
+    ImGui::NewFrame();
+    render_frame(view.bounds.size.width, view.bounds.size.height);
+    ImGui::Render();
+    ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
+    [enc endEncoding];
+
+    if (view.currentDrawable) [cb presentDrawable:view.currentDrawable];
+    [cb commit];
+}
+@end
+
+// ---------------------------------------------------------------------------
+// Overlay window: pass-through except inside capture rects
+// ---------------------------------------------------------------------------
+@interface ESPWindow : UIWindow
+@end
+
+@implementation ESPWindow
+- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+    std::lock_guard<std::mutex> l(g_rects_mtx);
+    for (const CGRect& r : g_capture_rects) {
+        if (CGRectContainsPoint(r, point))
+            return [super hitTest:point withEvent:event];
+    }
+    return nil; // let the game have the touch
+}
+@end
+
+static ESPWindow*   g_window   = nil;
+static ESPRenderer* g_renderer = nil;
+
+static void setup_overlay() {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) return;
+
+    CGRect frame = [UIScreen mainScreen].bounds;
+    g_window = [[ESPWindow alloc] initWithFrame:frame];
+    g_window.windowLevel = UIWindowLevelStatusBar + 1000;
+    g_window.backgroundColor = [UIColor clearColor];
+    g_window.opaque = NO;
+    g_window.userInteractionEnabled = YES;
+
+    UIViewController* vc = [UIViewController new];
+    g_window.rootViewController = vc;
+
+    ESPView* mtkView = [[ESPView alloc] initWithFrame:frame device:device];
+    mtkView.backgroundColor = [UIColor clearColor];
+    mtkView.opaque = NO;
+    mtkView.layer.opaque = NO;
+    mtkView.clearColor = MTLClearColorMake(0, 0, 0, 0);
+    mtkView.framebufferOnly = NO;
+    mtkView.enableSetNeedsDisplay = NO;
+    mtkView.paused = NO;
+    mtkView.preferredFramesPerSecond = 60;
+    mtkView.multipleTouchEnabled = YES;
+    vc.view = mtkView;
+
+    // ImGui context
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = NULL;
+    io.FontGlobalScale = 2.0f;     // readable on a phone screen
+    ImGui::StyleColorsDark();
+    ImGui::GetStyle().ScaleAllSizes(2.0f);
+    ImGui_ImplMetal_Init(device);
+
+    g_renderer = [ESPRenderer new];
+    g_renderer.queue = [device newCommandQueue];
+    mtkView.delegate = g_renderer;
+
+    [g_window makeKeyAndVisible];
+}
+
+// ---------------------------------------------------------------------------
+%ctor {
+    resolve_pointers();
+    // build the overlay a bit after launch so the app's UI exists first
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        setup_overlay();
+    });
+}

@@ -21,6 +21,10 @@ jobs:
           git clone --depth=1 https://github.com/theos/sdks.git $HOME/theos/sdks
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
+      - name: Vendor Dear ImGui
+        run: |
+          git clone --depth=1 --branch v1.91.5 https://github.com/ocornut/imgui.git imgui
+
       - name: Build Tweak
         run: |
           make package FINALPACKAGE=1 THEOS=$HOME/theos

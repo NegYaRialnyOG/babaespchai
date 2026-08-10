@@ -17,6 +17,6 @@ endif
 BlockpostESPLoader_FILES = LoaderTweak.xm
 BlockpostESPLoader_CFLAGS = -fobjc-arc -Wno-unused-variable -Wno-deprecated-declarations -DGH_TOKEN='"$(LOADER_TOKEN)"'
 BlockpostESPLoader_CCFLAGS = -std=c++17
-BlockpostESPLoader_FRAMEWORKS = Foundation
+BlockpostESPLoader_FRAMEWORKS = Foundation UIKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk

@@ -43,6 +43,8 @@ typedef void* (*il2cpp_class_get_type_t)(void*);
 typedef void* (*il2cpp_type_get_object_t)(void*);
 typedef void* (*il2cpp_object_get_class_t)(void*);
 typedef const char* (*il2cpp_class_get_name_t)(void*);
+typedef void* (*il2cpp_thread_attach_t)(void*);   // attach current thread to a domain
+typedef void* (*il2cpp_thread_current_t)();        // NULL if thread not attached
 
 static il2cpp_domain_get_t           il2cpp_domain_get           = NULL;
 static il2cpp_domain_assembly_open_t il2cpp_domain_assembly_open = NULL;
@@ -52,6 +54,8 @@ static il2cpp_class_get_type_t       il2cpp_class_get_type       = NULL;
 static il2cpp_type_get_object_t      il2cpp_type_get_object      = NULL;
 static il2cpp_object_get_class_t     il2cpp_object_get_class     = NULL;
 static il2cpp_class_get_name_t       il2cpp_class_get_name       = NULL;
+static il2cpp_thread_attach_t        il2cpp_thread_attach        = NULL;
+static il2cpp_thread_current_t       il2cpp_thread_current       = NULL;
 
 // RVAs (UnityFramework, build 260206) --------------------------------------
 #define RVA_W2S              0x321c108   // Camera.WorldToScreenPoint(Vector3) -> Vector3
@@ -68,6 +72,8 @@ static il2cpp_class_get_name_t       il2cpp_class_get_name       = NULL;
 #define RVA_il2cpp_type_get_object       0x10b0368
 #define RVA_il2cpp_object_get_class      0x10b027c
 #define RVA_il2cpp_class_get_name        0x10af998
+#define RVA_il2cpp_thread_attach         0x10b030c
+#define RVA_il2cpp_thread_current        0x10b0308
 
 // Live-tunable target -------------------------------------------------------
 static char      g_image_name[64] = "UnityFramework";
@@ -159,6 +165,23 @@ static void bind_pointers() {
     il2cpp_type_get_object      = (il2cpp_type_get_object_t)     (B + RVA_il2cpp_type_get_object);
     il2cpp_object_get_class     = (il2cpp_object_get_class_t)    (B + RVA_il2cpp_object_get_class);
     il2cpp_class_get_name       = (il2cpp_class_get_name_t)      (B + RVA_il2cpp_class_get_name);
+    il2cpp_thread_attach        = (il2cpp_thread_attach_t)       (B + RVA_il2cpp_thread_attach);
+    il2cpp_thread_current       = (il2cpp_thread_current_t)      (B + RVA_il2cpp_thread_current);
+}
+
+// Ensure the CURRENT thread (MTKView render thread) is attached to the il2cpp
+// domain. Calling any reflection/allocating il2cpp function from an unattached
+// thread deadlocks against the GC world-stop — that was the RESOLVE freeze.
+static bool g_attached = false;
+static bool ensure_attached() {
+    if (g_attached) return true;
+    if (!il2cpp_domain_get || !il2cpp_thread_attach) return false;
+    if (il2cpp_thread_current && il2cpp_thread_current()) { g_attached = true; return true; }
+    void* dom = il2cpp_domain_get();        // pure getter, safe on any thread
+    if (!dom) return false;
+    il2cpp_thread_attach(dom);
+    g_attached = true;
+    return true;
 }
 
 // Stepwise il2cpp resolve. g_resolve_step records how far we got so a crash
@@ -166,6 +189,7 @@ static void bind_pointers() {
 // may not be ready yet; call from the menu once you're in-game.
 static void resolve_all() {
     bind_pointers();
+    if (!ensure_attached()) { g_resolve_step = -1; return; }  // could not attach
     g_resolve_step = 1;
     g_dom = il2cpp_domain_get();
     g_resolve_step = 2;
@@ -351,7 +375,7 @@ static void render_frame(float screenW, float screenH) {
 
         ImGui::SeparatorText("State");
         if (ImGui::Button("RESOLVE il2cpp (tap in-game)")) resolve_all();
-        ImGui::Text("resolved=%d  step=%d", g_resolved ? 1 : 0, g_resolve_step);
+        ImGui::Text("resolved=%d step=%d attached=%d", g_resolved ? 1 : 0, g_resolve_step, g_attached ? 1 : 0);
         ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
         ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
         ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
@@ -374,7 +398,7 @@ static void render_frame(float screenW, float screenH) {
 
     // ESP: enumerate FRESH this frame and use immediately (no stale cache).
     // Gated behind g_resolved so we never touch the runtime before it's ready.
-    if (g_esp_on && g_resolved && W2S && Camera_get_main && Tf_get_pos && g_type_obj) {
+    if (g_esp_on && g_resolved && ensure_attached() && W2S && Camera_get_main && Tf_get_pos && g_type_obj) {
         std::vector<void*> targets;
         find_targets(targets);
         void* cam = Camera_get_main(NULL);

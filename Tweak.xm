@@ -29,12 +29,14 @@ struct Vector3 { float x, y, z; };
 struct Vector2 { float x, y; };
 
 // il2cpp methods take a trailing hidden `const MethodInfo* method` argument.
-// WorldToScreenPoint_Injected(this, Vector3* worldIn, Vector3* screenOut, method)
-typedef void  (*W2S_Injected_t)(void* camera, Vector3* in, Vector3* out, void* method);
+// Camera.WorldToScreenPoint(Vector3): instance method, returns Vector3 by value
+// (x,y in pixels from bottom-left, z = depth). No out-ptr, no eye arg -> nothing
+// to misalign. (The _Injected variant crashed because it needs (ref,eye,out).)
+typedef Vector3 (*W2S_t)(void* camera, Vector3 pos, void* method);
 typedef void* (*Camera_get_main_t)(void* method);
 typedef Vector3 (*Motor_get_TransientPosition_t)(void* motor, void* method);
 
-static W2S_Injected_t                 W2S            = NULL;
+static W2S_t                          W2S            = NULL;
 static Camera_get_main_t              Camera_get_main= NULL;
 static Motor_get_TransientPosition_t  Motor_get_TP   = NULL;
 
@@ -77,7 +79,7 @@ static il2cpp_thread_attach_t             il2cpp_thread_attach            = NULL
 // Live-tunable offsets / RVAs (all relative to g_image_base)
 // ---------------------------------------------------------------------------
 static char      g_image_name[64]   = "UnityFramework";
-static uintptr_t g_rva_w2s          = 0x321bed8; // Camera.WorldToScreenPoint_Injected
+static uintptr_t g_rva_w2s          = 0x321c108; // Camera.WorldToScreenPoint(Vector3) by value
 static uintptr_t g_rva_getmain      = 0x321c3d4; // Camera.get_main
 static uintptr_t g_rva_tp           = 0x17c93b8; // KinematicCharacterMotor.get_TransientPosition
 static uintptr_t g_off_ctrl         = 0x1B0;     // motor -> CharacterController (ICharacterController)
@@ -222,7 +224,7 @@ static std::string build_debug_dump() {
             Vector3 p = Motor_get_TP(m, NULL);
             snprintf(b, sizeof(b), "   pos=(%.2f,%.2f,%.2f)", p.x, p.y, p.z); o += b;
             if (g_dbg_w2s && cam && W2S) {
-                Vector3 s = {0,0,0}; W2S(cam, &p, &s, NULL);
+                Vector3 s = W2S(cam, p, NULL);
                 snprintf(b, sizeof(b), "  screen=(%.1f,%.1f,z=%.2f)", s.x, s.y, s.z); o += b;
             }
             o += "\n";
@@ -312,9 +314,8 @@ static void render_frame(float screenW, float screenH) {
                 Vector3 feet = Motor_get_TP(m, NULL);
                 Vector3 head = feet; head.y += g_box_height;
 
-                Vector3 sf, sh;
-                W2S(cam, &feet, &sf, NULL);
-                W2S(cam, &head, &sh, NULL);
+                Vector3 sf = W2S(cam, feet, NULL);
+                Vector3 sh = W2S(cam, head, NULL);
                 if (sf.z <= 0.0f) continue; // behind camera
 
                 float feetY = screenH - sf.y;   // Unity origin bottom-left -> UIKit top-left

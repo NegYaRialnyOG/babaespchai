@@ -137,7 +137,7 @@ static void resolve_all() {
 
     resolve_il2cpp_api(g_image_base);
 
-    W2S             = g_rva_w2s     ? (W2S_Injected_t)(g_image_base + g_rva_w2s)                : NULL;
+    W2S             = g_rva_w2s     ? (W2S_t)(g_image_base + g_rva_w2s)                        : NULL;
     Camera_get_main = g_rva_getmain ? (Camera_get_main_t)(g_image_base + g_rva_getmain)         : NULL;
     Motor_get_TP    = g_rva_tp      ? (Motor_get_TransientPosition_t)(g_image_base + g_rva_tp)  : NULL;
 

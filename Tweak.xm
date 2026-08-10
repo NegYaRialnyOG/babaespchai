@@ -70,8 +70,10 @@ static char      g_image_name[64] = "UnityFramework";
 static char      g_target_ns[64]  = "";       // BotAI has no namespace
 static char      g_target_cls[64] = "BotAI";  // what to draw boxes on
 static uintptr_t g_off_tf         = 0x20;     // Transform field inside target (BotAI._meshesRoot)
-static uintptr_t g_off_team       = 0x28;     // team int inside target (BotAI, guess)
-static float     g_box_height     = 1.8f;
+static uintptr_t g_off_team       = 0x0;      // team int inside target (unknown yet -> off)
+static float     g_head_off       = 0.2f;     // world units from anchor up to box TOP
+static float     g_feet_off       = -1.9f;    // world units from anchor down to box BOTTOM
+static float     g_width_mult     = 0.45f;    // box width as fraction of its height
 
 static uintptr_t g_image_base = 0;
 static void*     g_img        = NULL;   // Assembly-CSharp image
@@ -260,7 +262,9 @@ static void render_frame(float screenW, float screenH) {
         ImGui::Checkbox("ESP", &g_esp_on); ImGui::SameLine();
         ImGui::Checkbox("Enemies only", &g_enemies_only);
         ImGui::InputInt("Local team", &g_local_team);
-        ImGui::SliderFloat("Box height", &g_box_height, 0.5f, 3.0f);
+        ImGui::SliderFloat("Box top",   &g_head_off, -3.0f, 3.0f);
+        ImGui::SliderFloat("Box bottom",&g_feet_off, -3.0f, 3.0f);
+        ImGui::SliderFloat("Box width", &g_width_mult, 0.1f, 1.0f);
 
         if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {
             ImGui::InputText("image", g_image_name, sizeof(g_image_name));
@@ -300,19 +304,20 @@ static void render_frame(float screenW, float screenH) {
                     int tm = obj_team(obj);
                     if (tm == g_local_team) continue;
                 }
-                Vector3 feet;
-                if (!obj_pos(obj, feet)) continue;
-                Vector3 head = feet; head.y += g_box_height;
-                Vector3 sf = W2S(cam, feet, NULL);
-                Vector3 sh = W2S(cam, head, NULL);
-                if (sf.z <= 0.0f) continue;             // behind camera
-                float feetY = screenH - sf.y;           // Unity bottom-left -> UIKit top-left
-                float headY = screenH - sh.y;
-                float cx = sf.x;
+                Vector3 anchor;
+                if (!obj_pos(obj, anchor)) continue;
+                Vector3 top = anchor; top.y += g_head_off;
+                Vector3 bot = anchor; bot.y += g_feet_off;
+                Vector3 sTop = W2S(cam, top, NULL);
+                Vector3 sBot = W2S(cam, bot, NULL);
+                if (sBot.z <= 0.0f) continue;           // behind camera
+                float botY = screenH - sBot.y;          // Unity bottom-left -> UIKit top-left
+                float topY = screenH - sTop.y;
+                float cx = sBot.x;
                 if (cx <= 0 || cx >= screenW) continue;
-                float h = feetY - headY; if (h < 6) h = 6;
-                float w = h * 0.45f;
-                ImVec2 tl(cx - w*0.5f, headY), br(cx + w*0.5f, feetY);
+                float h = botY - topY; if (h < 6) h = 6;
+                float w = h * g_width_mult;
+                ImVec2 tl(cx - w*0.5f, topY), br(cx + w*0.5f, botY);
                 dl->AddRect(ImVec2(tl.x-1,tl.y-1), ImVec2(br.x+1,br.y+1), IM_COL32(0,0,0,180), 0,0,3.0f);
                 dl->AddRect(tl, br, IM_COL32(255,40,40,255), 0,0,1.5f);
             }

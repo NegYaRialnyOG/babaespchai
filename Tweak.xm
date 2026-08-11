@@ -183,18 +183,16 @@ static bool      g_show_health_txt = false;
 static bool      g_show_armor_bar  = false;
 static bool      g_show_weapon     = false;
 
-// --- Visual aimbot: plain field write, no function hooking ---------------
-// ExampleCharacterController.lookInputVector (public field, name AND offset
-// both survived obfuscation untouched — it's part of the open-source
-// KinematicCharacterController asset, offsets confirmed identical to the
-// Android source: moveInputVector=0xF0, lookInputVector=0xFC). This is the
-// SAME field the game's own touch-drag code writes every frame to steer the
-// camera — we just also write to it, so the character visibly turns toward
-// the target exactly like a real touch-drag would. No hooking, no send_pos
-// interception (there were 5 signature-identical candidates for that in the
-// dump and no safe way to tell them apart without a disassembler — hooking
-// the wrong one risks crashing every time the player moves).
-static uintptr_t g_ecc_lookInput = 0xfc;   // ExampleCharacterController.lookInputVector (Vector3)
+// --- Aimbot: SetInputs hook, writes the camera-rotation quaternion --------
+// ExampleCharacterController.lookInputVector (0xFC) turned out to be the
+// WRONG field — writing it never got overwritten cleanly enough to steer the
+// camera. The actual field the game reads for aim is a quaternion,
+// m_qCameraRotation, INSIDE the inputs struct passed BY REFERENCE to
+// SetInputs — at offset 0x18 in that struct, confirmed against a working
+// reference implementation for this exact game
+// (PlayerCharacterInputs$$CameraRotation = 0x18). Must be written before
+// forwarding to the original SetInputs so the frame actually consumes it.
+static uintptr_t g_ecc_camrot_off = 0x18;  // PlayerCharacterInputs.m_qCameraRotation (Quaternion) inside the SetInputs arg struct
 static char      g_ecc_ns[64]    = "KinematicCharacterController.Examples";
 static char      g_ecc_cls[64]   = "ExampleCharacterController";
 static void*     g_ecc_type_obj  = NULL;   // cached System.Type for the above
@@ -861,9 +859,28 @@ static void compute_boxes() {
 // forwarding to the real SetInputs, guarantees our write lands in the exact
 // frame window between "game finished its own input processing" and
 // "controller consumes lookInputVector for rotation" — every single frame.
-static void apply_aimbot(void* controller) {
+// Quaternion layout matches Unity's own (x,y,z,w), 16 bytes — standard, not
+// build-specific.
+struct Quat { float x, y, z, w; };
+
+// Unity's exact Quaternion.Euler formula (pitch=x, yaw=y, roll=z, degrees),
+// lifted directly from a working reference implementation for this game.
+static Quat euler_to_quat_unity(float pitchDeg, float yawDeg, float rollDeg) {
+    const float d2r = (float)M_PI / 180.0f;
+    float cx = cosf(pitchDeg * d2r * 0.5f), sx = sinf(pitchDeg * d2r * 0.5f);
+    float cy = cosf(yawDeg   * d2r * 0.5f), sy = sinf(yawDeg   * d2r * 0.5f);
+    float cz = cosf(rollDeg  * d2r * 0.5f), sz = sinf(rollDeg  * d2r * 0.5f);
+    Quat q;
+    q.x = cx*sy*sz + cy*cz*sx;
+    q.y = cx*cz*sy - cy*sx*sz;
+    q.z = cx*cy*sz - cz*sx*sy;
+    q.w = sx*sy*sz + cx*cy*cz;
+    return q;
+}
+
+static void apply_aimbot(void* controller, void* inputsPtr) {
     if (!g_aimbot_on || !g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) return;
-    if (!safe_ptr(controller)) return;
+    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) return;
 
     void* cam = Camera_get_main(NULL);
     if (!cam) return;
@@ -951,17 +968,35 @@ static void apply_aimbot(void* controller) {
     g_raycast_targets_blocked = blockedCount;
     if (!best) return;
 
-    Vector3 dir;
-    dir.x = bestAimPoint.x - eye.x; dir.y = bestAimPoint.y - eye.y; dir.z = bestAimPoint.z - eye.z;
-    float len = sqrtf(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
-    if (len < 0.001f) return;
-    dir.x /= len; dir.y /= len; dir.z /= len;
+    // Pitch/yaw from eye->target, exactly matching the reference's calcAngle
+    // (note: delta is eye-minus-target, not target-minus-eye — the sign
+    // convention the atan2/asin below are built around).
+    Vector3 d{ eye.x - bestAimPoint.x, eye.y - bestAimPoint.y, eye.z - bestAimPoint.z };
+    float mag = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+    if (mag < 0.001f) return;
+    const float r2d = 180.0f / (float)M_PI;
+    float pitch = asinf(d.y / mag) * r2d;
+    float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
 
-    Vector3* cur = (Vector3*)((char*)controller + g_ecc_lookInput);
+    // THE actual fix: the field that steers the camera is a quaternion
+    // (m_qCameraRotation) INSIDE the inputs struct passed to SetInputs, at
+    // offset 0x18 — not ExampleCharacterController.lookInputVector, which is
+    // apparently something else (movement-relative input, not camera aim).
+    // Confirmed against a working reference implementation for this exact
+    // game (PlayerCharacterInputs$$CameraRotation = 0x18). Must be written
+    // BEFORE calling the original SetInputs so the game actually consumes
+    // our value this frame, not after.
+    Quat targetQ = euler_to_quat_unity(pitch, yaw, 0.0f);
+    Quat* cur = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
     float t = g_aimbot_smooth; if (t < 0.02f) t = 0.02f; if (t > 1.0f) t = 1.0f;
-    cur->x += (dir.x - cur->x) * t;
-    cur->y += (dir.y - cur->y) * t;
-    cur->z += (dir.z - cur->z) * t;
+    Quat blended;
+    blended.x = cur->x + (targetQ.x - cur->x) * t;
+    blended.y = cur->y + (targetQ.y - cur->y) * t;
+    blended.z = cur->z + (targetQ.z - cur->z) * t;
+    blended.w = cur->w + (targetQ.w - cur->w) * t;
+    float n = sqrtf(blended.x*blended.x + blended.y*blended.y + blended.z*blended.z + blended.w*blended.w);
+    if (n > 0.0001f) { blended.x/=n; blended.y/=n; blended.z/=n; blended.w/=n; }
+    *cur = blended;
 }
 
 // ---------------------------------------------------------------------------
@@ -969,11 +1004,9 @@ static void apply_aimbot(void* controller) {
 // candidates): this exact overload keeps its real name AND matches the
 // source's own hook point, because it's a public contract method of the
 // open-source KinematicCharacterController asset that couldn't be safely
-// renamed. We never touch the `inputs` struct itself (its field layout in
-// this build is unknown/unverified) — just call straight through to the
-// original first (zero risk of corrupting whatever the game passed in), then
-// apply our own override directly to the controller instance, whose layout
-// (lookInputVector @ 0xFC) we've already confirmed byte-for-byte.
+// renamed. We DO now write into the `inputs` struct — specifically only the
+// m_qCameraRotation quaternion at the confirmed offset 0x18 — before
+// forwarding to the original, which is what actually applies our aim.
 #define RVA_ECC_SETINPUTS 0x2d8f68c
 typedef void (*ECC_SetInputs_t)(void*, void*, void*);
 static ECC_SetInputs_t Orig_ECC_SetInputs = NULL;
@@ -982,10 +1015,13 @@ static long g_hook_call_count = 0;     // proves whether the hook fires AT ALL d
 static void* g_hook_last_thiz = NULL;  // which controller instance is actually calling us
 
 static void Hook_ECC_SetInputs(void* thiz, void* inputs, void* method) {
-    if (Orig_ECC_SetInputs) Orig_ECC_SetInputs(thiz, inputs, method);
     g_hook_call_count++;
     g_hook_last_thiz = thiz;
-    apply_aimbot(thiz);
+    // Modify BEFORE forwarding — the original SetInputs is what actually
+    // consumes m_qCameraRotation for this frame, so our value must already
+    // be in place when it runs, not written after the fact.
+    apply_aimbot(thiz, inputs);
+    if (Orig_ECC_SetInputs) Orig_ECC_SetInputs(thiz, inputs, method);
 }
 
 static void install_aimbot_hook() {

@@ -10,6 +10,8 @@
 #import <UIKit/UIKit.h>
 #import <MetalKit/MetalKit.h>
 #import <Metal/Metal.h>
+#include <IOKit/IOKitLib.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <string.h>
 #include <vector>
@@ -244,6 +246,23 @@ static const char* kBoneNames[] = { "Stomach","Lower Chest","Chest","Head",
                                      "R UpperArm","R LowerArm","R Hand","R UpperLeg","R LowerLeg",
                                      "L UpperArm","L LowerArm","L Hand","L UpperLeg","L LowerLeg" };
 static const int  kAllBoneCount = 14;
+
+// UI-facing hitbox groups: the 14 individual bones above are still what
+// aiming/triggerbot actually check (g_hitbox_sel stays indexed by BoneIdx),
+// but the menu only exposes 4 toggle rows — picking a group flips every bone
+// inside it together.
+static const int kGroupHeadBones[] = { BONE_HEAD };
+static const int kGroupBodyBones[] = { BONE_STOMACH, BONE_LOWERCHEST, BONE_CHEST };
+static const int kGroupArmsBones[] = { BONE_R_UPARM, BONE_R_LOARM, BONE_R_HAND, BONE_L_UPARM, BONE_L_LOARM, BONE_L_HAND };
+static const int kGroupLegsBones[] = { BONE_R_UPLEG, BONE_R_LOLEG, BONE_L_UPLEG, BONE_L_LOLEG };
+struct HitboxGroup { const char* name; const int* bones; int count; };
+static const HitboxGroup kHitboxGroups[] = {
+    { "Head", kGroupHeadBones, 1 },
+    { "Body", kGroupBodyBones, 3 },
+    { "Arms", kGroupArmsBones, 6 },
+    { "Legs", kGroupLegsBones, 4 },
+};
+static const int kHitboxGroupCount = 4;
 
 // Triggerbot: fires a simulated tap once the crosshair is directly on a
 // selected hitbox — independent of the visual aimbot/assist, works with
@@ -1468,9 +1487,14 @@ static void render_frame(float screenW, float screenH) {
                 if (ImGui::Button("Select all")) { for (int i = 0; i < kAllBoneCount; i++) g_hitbox_sel[kAllBoneIndices[i]] = true; }
                 ImGui::SameLine();
                 if (ImGui::Button("Clear")) { for (int i = 0; i < kAllBoneCount; i++) g_hitbox_sel[kAllBoneIndices[i]] = false; }
-                for (int i = 0; i < kAllBoneCount; i++) {
-                    ImGui::Checkbox(kBoneNames[i], &g_hitbox_sel[kAllBoneIndices[i]]);
-                    if ((i % 2) == 0 && i + 1 < kAllBoneCount) ImGui::SameLine();
+                for (int g = 0; g < kHitboxGroupCount; g++) {
+                    const HitboxGroup& grp = kHitboxGroups[g];
+                    bool anySel = false;
+                    for (int i = 0; i < grp.count; i++) if (g_hitbox_sel[grp.bones[i]]) anySel = true;
+                    if (ImGui::Selectable(grp.name, anySel)) {
+                        bool turnOn = !anySel;
+                        for (int i = 0; i < grp.count; i++) g_hitbox_sel[grp.bones[i]] = turnOn;
+                    }
                 }
 
                 ImGui::SeparatorText("Triggerbot");
@@ -1555,10 +1579,9 @@ static void render_frame(float screenW, float screenH) {
     g_scrW = screenW; g_scrH = screenH;
     if (g_trigger_tap_x < 0.0f && g_scrW > 0) { g_trigger_tap_x = g_scrW * 0.5f; g_trigger_tap_y = g_scrH * 0.5f; }
 
-    // Draggable triggerbot tap-point marker — visible (and calibratable)
-    // even with the settings menu closed, since you need to see the actual
-    // game UI underneath to line it up with the real fire button/zone.
-    if (g_trigger_on && g_scrW > 0 && g_scrH > 0) {
+    // Draggable triggerbot tap-point marker — only shown while the settings
+    // menu itself is open (calibrate it, close the menu, marker goes away).
+    if (g_menu_open && g_trigger_on && g_scrW > 0 && g_scrH > 0) {
         ImGui::SetNextWindowPos(ImVec2(g_trigger_tap_x - 22, g_trigger_tap_y - 22), ImGuiCond_Once);
         ImGui::SetNextWindowSize(ImVec2(44, 44), ImGuiCond_Always);
         ImGui::Begin("##triggerpoint", nullptr,
@@ -1687,6 +1710,48 @@ static void render_frame(float screenW, float screenH) {
 - (void)touchesCancelled:(NSSet<UITouch*>*)t withEvent:(UIEvent*)e { [self feedTouch:t.anyObject down:0]; }
 @end
 
+// ---------------------------------------------------------------------------
+// iOS keyboard bridge for ImGui::InputText. There's no imgui_impl_ios here —
+// only imgui_impl_metal for drawing — and touch input is fed to ImGui as
+// plain mouse position/button events (see ESPView.feedTouch below), nothing
+// that would ever summon the system keyboard. So tapping the Config tab's
+// Name field just silently did nothing: ImGui thought it had focus, but no
+// UIResponder ever asked iOS for a keyboard. Fix: a zero-size, invisible
+// UITextField piggybacks — it becomes first responder (which is what
+// actually raises the real keyboard) whenever ImGui itself reports a widget
+// wants text input, and every keystroke is intercepted in the delegate
+// before it touches the field's own (unused) text storage and is pushed
+// straight into ImGui's input queue instead.
+@interface ESPKeyboardBridge : NSObject <UITextFieldDelegate>
+@end
+@implementation ESPKeyboardBridge
+- (BOOL)textField:(UITextField*)tf shouldChangeCharactersInRange:(NSRange)range replacementString:(NSString*)s {
+    ImGuiIO& io = ImGui::GetIO();
+    if (s.length == 0 && range.length > 0) {
+        io.AddKeyEvent(ImGuiKey_Backspace, true);
+        io.AddKeyEvent(ImGuiKey_Backspace, false);
+    } else if (s.length > 0) {
+        io.AddInputCharactersUTF8(s.UTF8String);
+    }
+    return NO; // keep the field's own text empty — ImGui owns the actual buffer
+}
+@end
+static UITextField*       g_kbField  = nil;
+static ESPKeyboardBridge* g_kbBridge = nil;
+
+// Polled once per frame: mirrors ImGui's notion of "a text widget is active"
+// onto UIKit's actual first-responder state, which is what shows/hides the
+// real keyboard.
+static void sync_keyboard_bridge() {
+    if (!g_kbField) return;
+    bool want = ImGui::GetIO().WantTextInput;
+    if (want && !g_kbField.isFirstResponder) {
+        [g_kbField becomeFirstResponder];
+    } else if (!want && g_kbField.isFirstResponder) {
+        [g_kbField resignFirstResponder];
+    }
+}
+
 @interface ESPRenderer : NSObject <MTKViewDelegate>
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
 @end
@@ -1704,6 +1769,7 @@ static void render_frame(float screenW, float screenH) {
     ImGui_ImplMetal_NewFrame(rpd);
     ImGui::NewFrame();
     render_frame(view.bounds.size.width, view.bounds.size.height);
+    sync_keyboard_bridge();
     ImGui::Render();
     ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
     [enc endEncoding];
@@ -1774,61 +1840,77 @@ static UIView* find_game_root_view() {
 }
 
 // ---------------------------------------------------------------------------
-// Auto Shoot: fires by simulating a real tap on the game's own view, NOT by
-// calling any native fire function directly. The actual fire RPC
-// (Client::send_attackv2) has the SAME kind of ambiguity send_pos had — 0
-// explicit C# params, so signature matching gives zero narrowing at all, and
-// there are dozens of same-shaped candidates in Client alone. A wrong call
-// there is far riskier than a wrong PASSIVE hook (send_pos's fix above):
-// it's an unverified void function pointer invoked every tick the condition
-// holds, with completely unknown side effects. So instead of guessing,
-// this synthesizes the exact input a real player already gives to shoot —
-// a tap on the game view — using UIKit's PRIVATE UITouch construction
-// (undocumented, version-sensitive; a long-standing technique in jailbreak
-// "autotap" tooling). Every step is guarded (respondsToSelector / @try) so
-// a shape mismatch on some iOS version just silently no-ops instead of
-// crashing — this is genuinely best-effort and may need adjusting once
-// tested for real.
+// Auto Shoot: fires by simulating a real tap, NOT by calling any native fire
+// function directly. The actual fire RPC (Client::send_attackv2) has the
+// SAME kind of ambiguity send_pos had — 0 explicit C# params, dozens of
+// same-shaped candidates in Client alone — too risky to call blind. So
+// instead this synthesizes the input a real player gives to shoot: a tap.
+//
+// FIRST attempt at that (kept only in git history now) built a UITouch via
+// private KVC keys and called touchesBegan: directly on the game's root
+// UIView. That never fires here: Unity doesn't listen on the standard
+// UIResponder chain of an arbitrary UIView, it reads touches off its own
+// input surface, so a hand-built UITouch injected via touchesBegan: on the
+// wrong view is simply never seen by the game at all.
+//
+// This version instead injects at the IOHID layer — the same layer the
+// digitizer (touchscreen) driver itself posts real finger events on via
+// IOHIDEventSystemClient — so it looks like a real hardware touch to EVERY
+// app, Unity included, no view/responder-chain guessing required. This is
+// the same private-but-long-stable technique used by jailbreak
+// autoclicker/autotap tools for years. The struct/consts aren't in the
+// public SDK headers, but the signatures below have been stable across iOS
+// versions; still genuinely best-effort until confirmed on a real device —
+// if it turns out to need normalized (0..1) coordinates instead of raw
+// points on this iOS version, that's the first thing to try adjusting.
+typedef struct __IOHIDEvent *IOHIDEventRef;
+typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+
+extern "C" {
+IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
+IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(CFAllocatorRef allocator,
+                                                    uint64_t timeStamp,
+                                                    uint32_t index,
+                                                    uint32_t identity,
+                                                    uint32_t eventMask,
+                                                    uint32_t buttonMask,
+                                                    float x, float y, float z,
+                                                    float tipPressure, float twist,
+                                                    int range, int touch,
+                                                    uint32_t options);
+void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
+}
+
+// kIOHIDDigitizerEventRange / kIOHIDDigitizerEventTouch — bit 0 / bit 1 of
+// the digitizer eventMask, per the long-standing private IOHIDEventTypes.h.
+enum { kHIDDigitizerRange = 1 << 0, kHIDDigitizerTouch = 1 << 1 };
+
+static IOHIDEventSystemClientRef g_hidClient = NULL;
+
+static void hid_dispatch_finger(CGPoint pt, bool touching) {
+    if (!g_hidClient) g_hidClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    if (!g_hidClient) return;
+
+    CGRect bounds = [UIScreen mainScreen].bounds;
+    float nx = (bounds.size.width  > 0) ? (float)(pt.x / bounds.size.width)  : 0.0f;
+    float ny = (bounds.size.height > 0) ? (float)(pt.y / bounds.size.height) : 0.0f;
+
+    IOHIDEventRef ev = IOHIDEventCreateDigitizerFingerEvent(
+        kCFAllocatorDefault, mach_absolute_time(),
+        /*index*/ 1, /*identity*/ 2,
+        (kHIDDigitizerRange | kHIDDigitizerTouch), /*buttonMask*/ 0,
+        nx, ny, /*z*/ 0.0f, /*tipPressure*/ touching ? 1.0f : 0.0f, /*twist*/ 0.0f,
+        /*range*/ touching ? 1 : 0, /*touch*/ touching ? 1 : 0, /*options*/ 0);
+    if (!ev) return;
+    IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
+    CFRelease(ev);
+}
+
 static void inject_tap(CGPoint point) {
-    UIView* root = find_game_root_view();
-    if (!root) return;
-
-    Class touchClass = NSClassFromString(@"UITouch");
-    if (!touchClass) return;
-    id touch = [[touchClass alloc] init];
-    if (!touch) return;
-
-    @try {
-        [touch setValue:root.window forKey:@"_window"];
-        [touch setValue:root forKey:@"_view"];
-        [touch setValue:@1 forKey:@"_tapCount"];
-        [touch setValue:@([[NSProcessInfo processInfo] systemUptime]) forKey:@"_timestamp"];
-        [touch setValue:@0 forKey:@"_phase"]; // UITouchPhaseBegan
-    } @catch (...) { return; }
-
-    SEL setLoc = NSSelectorFromString(@"_setLocationInWindow:resetPrevious:");
-    if (![touch respondsToSelector:setLoc]) return;
-    @try {
-        NSMethodSignature* sig = [touch methodSignatureForSelector:setLoc];
-        NSInvocation* inv = [NSInvocation invocationWithMethodSignature:sig];
-        inv.selector = setLoc;
-        BOOL resetPrev = YES;
-        [inv setArgument:&point atIndex:2];
-        [inv setArgument:&resetPrev atIndex:3];
-        [inv invokeWithTarget:touch];
-    } @catch (...) { return; }
-
-    NSSet* touchSet = [NSSet setWithObject:touch];
-    id event = [[NSClassFromString(@"UITouchesEvent") alloc] init];
-    if ([root respondsToSelector:@selector(touchesBegan:withEvent:)]) {
-        [root touchesBegan:touchSet withEvent:event];
-    }
+    hid_dispatch_finger(point, true);
     // Release phase a beat later — a brief tap, not a held-down touch.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @try { [touch setValue:@3 forKey:@"_phase"]; } @catch (...) { return; } // UITouchPhaseEnded
-        if ([root respondsToSelector:@selector(touchesEnded:withEvent:)]) {
-            [root touchesEnded:touchSet withEvent:event];
-        }
+        hid_dispatch_finger(point, false);
     });
 }
 
@@ -1961,6 +2043,14 @@ static void setup_overlay() {
     mtk.preferredFramesPerSecond = 60;
     mtk.multipleTouchEnabled = YES;
     vc.view = mtk;
+
+    g_kbBridge = [ESPKeyboardBridge new];
+    g_kbField = [[UITextField alloc] initWithFrame:CGRectMake(-100, -100, 1, 1)];
+    g_kbField.delegate = g_kbBridge;
+    g_kbField.autocorrectionType = UITextAutocorrectionTypeNo;
+    g_kbField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    g_kbField.spellCheckingType = UITextSpellCheckingTypeNo;
+    [mtk addSubview:g_kbField];
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

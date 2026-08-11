@@ -214,6 +214,12 @@ static int       g_aimbot_bone       = BONE_CHEST; // which bone to aim at, when
 static bool      g_aimbot_wallcheck  = true;   // skip targets with no clear line of sight (Physics.Raycast)
 static int       g_raycast_floor_test = -1;    // -1=not run, 0=no hit, 1=hit — sanity check the Raycast binding itself
 static int       g_raycast_targets_blocked = 0; // how many candidates the wallcheck rejected, last tick
+static int       g_aimbot_bone_hits   = 0;   // last-tick: candidates where get_bone_pos succeeded
+static int       g_aimbot_bone_misses = 0;   // last-tick: candidates that fell back to the flat Pos field
+static bool      g_aimbot_used_bone   = false; // did the FINAL picked target use a real bone, or fallback Pos
+static float     g_aimbot_last_pitch  = 0, g_aimbot_last_yaw = 0;
+static Vector3   g_aimbot_last_eye{}, g_aimbot_last_aimpoint{};
+static int       g_aimbot_candidates  = 0;   // how many passed health/team/FOV before wallcheck
 
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
@@ -938,8 +944,9 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         g_raycast_floor_test = -1;
     }
     int blockedCount = 0;
+    int boneHits = 0, boneMisses = 0, candidates = 0;
 
-    void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{};
+    void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{}; bool bestUsedBone = false;
     for (void* obj : players) {
         if (*(bool*)((char*)obj + g_pd_local)) continue;
         int hp = *(int*)((char*)obj + g_pd_health);
@@ -949,8 +956,9 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
             if (tm == effectiveLocalTeam) continue;
         }
         Vector3 aimPoint, bonePos;
-        if (get_bone_pos(obj, g_aimbot_bone, bonePos)) aimPoint = bonePos;
-        else aimPoint = *(Vector3*)((char*)obj + g_pd_pos);
+        bool usedBone = get_bone_pos(obj, g_aimbot_bone, bonePos);
+        if (usedBone) { aimPoint = bonePos; boneHits++; }
+        else { aimPoint = *(Vector3*)((char*)obj + g_pd_pos); boneMisses++; }
 
         Vector3 s = W2S(cam, aimPoint, NULL);
         if (s.z <= 0.0f) continue;
@@ -958,6 +966,7 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         float dx = ux - cxScreen, dy = uy - cyScreen;
         float d2 = dx*dx + dy*dy;
         if (d2 > g_aimbot_fov_px * g_aimbot_fov_px) continue;
+        candidates++;
         if (d2 >= bestDist2) continue;
 
         if (g_aimbot_wallcheck && Physics_Raycast) {
@@ -973,10 +982,14 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
             }
         }
 
-        bestDist2 = d2; best = obj; bestAimPoint = aimPoint;
+        bestDist2 = d2; best = obj; bestAimPoint = aimPoint; bestUsedBone = usedBone;
     }
     g_raycast_targets_blocked = blockedCount;
+    g_aimbot_bone_hits = boneHits; g_aimbot_bone_misses = boneMisses; g_aimbot_candidates = candidates;
     if (!best) return;
+    g_aimbot_used_bone = bestUsedBone;
+    g_aimbot_last_eye = eye;
+    g_aimbot_last_aimpoint = bestAimPoint;
 
     // Pitch/yaw from eye->target, exactly matching the reference's calcAngle
     // (note: delta is eye-minus-target, not target-minus-eye — the sign
@@ -987,15 +1000,15 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     const float r2d = 180.0f / (float)M_PI;
     float pitch = asinf(d.y / mag) * r2d;
     float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
+    g_aimbot_last_pitch = pitch; g_aimbot_last_yaw = yaw;
 
-    // THE actual fix: the field that steers the camera is a quaternion
-    // (m_qCameraRotation) INSIDE the inputs struct passed to SetInputs, at
-    // offset 0x18 — not ExampleCharacterController.lookInputVector, which is
-    // apparently something else (movement-relative input, not camera aim).
-    // Confirmed against a working reference implementation for this exact
-    // game (PlayerCharacterInputs$$CameraRotation = 0x18). Must be written
-    // BEFORE calling the original SetInputs so the game actually consumes
-    // our value this frame, not after.
+    // The field that steers the camera is a quaternion (m_qCameraRotation)
+    // INSIDE the inputs struct passed to SetInputs, at offset 0x8 in OUR
+    // build's own struct layout (verified directly against dump.cs — an
+    // earlier attempt borrowed 0x18 from a different build and it was wrong,
+    // see g_ecc_camrot_off's declaration comment). Must be written BEFORE
+    // calling the original SetInputs so the game actually consumes our value
+    // this frame, not after.
     Quat targetQ = euler_to_quat_unity(pitch, yaw, 0.0f);
     Quat* cur = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
     float t = g_aimbot_smooth; if (t < 0.02f) t = 0.02f; if (t > 1.0f) t = 1.0f;
@@ -1296,6 +1309,14 @@ static void render_frame(float screenW, float screenH) {
         snprintf(buf, sizeof(buf), "raycast floor_test=%d (1=working)  blocked_last_tick=%d",
                  g_raycast_floor_test, g_raycast_targets_blocked);
         draw_outlined_text(dl, ImVec2(10, 58), IM_COL32(255,180,80,255), buf);
+        snprintf(buf, sizeof(buf), "aim candidates=%d boneHit=%d boneMiss=%d usedBone(final)=%d pitch=%.1f yaw=%.1f",
+                 g_aimbot_candidates, g_aimbot_bone_hits, g_aimbot_bone_misses, g_aimbot_used_bone,
+                 g_aimbot_last_pitch, g_aimbot_last_yaw);
+        draw_outlined_text(dl, ImVec2(10, 82), IM_COL32(180,220,255,255), buf);
+        snprintf(buf, sizeof(buf), "eye=(%.1f,%.1f,%.1f) aimpoint=(%.1f,%.1f,%.1f)",
+                 g_aimbot_last_eye.x, g_aimbot_last_eye.y, g_aimbot_last_eye.z,
+                 g_aimbot_last_aimpoint.x, g_aimbot_last_aimpoint.y, g_aimbot_last_aimpoint.z);
+        draw_outlined_text(dl, ImVec2(10, 106), IM_COL32(180,220,255,255), buf);
     }
 
     { std::lock_guard<std::mutex> l(g_rects_mtx); g_capture_rects = rects; }

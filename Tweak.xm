@@ -16,6 +16,8 @@
 #include <mutex>
 #include <string>
 #include <cmath>
+#include <fstream>
+#include <algorithm>
 #include <substrate.h>
 
 #include "imgui.h"
@@ -135,7 +137,7 @@ static float     g_width_mult     = 0.45f;     // box width as fraction of its h
 // array slots are mostly stale/unused, which used to slip past the sanity
 // check and draw garbage boxes nowhere near anyone. Switch to PLH manually
 // once you're in a real player match.
-static int  g_esp_src   = 0;            // 0 = FindObjectsOfType(class), 1 = PLH players
+static int  g_esp_src   = 1;            // hardcoded to PLH players (real players, bone-accurate) — the only ESP mode that ships now
 static char g_plh_cls[32]   = "PLH";
 static char g_plh_field[32] = "PAFMAJGGFBD";   // auto-picked by resolve_all; this is just the last winner
 // Every field PLH could plausibly hold the player array under, tried automatically.
@@ -211,19 +213,51 @@ static char      g_ecc_ns[64]    = "KinematicCharacterController.Examples";
 static char      g_ecc_cls[64]   = "ExampleCharacterController";
 static void*     g_ecc_type_obj  = NULL;   // cached System.Type for the above
 static bool      g_aimbot_on         = false;
+// Assist mode: blend from the REAL current view (whatever the player's own
+// manual input already set this tick) toward the target, instead of from
+// our own persistent auto-lock state. The persistent-state design (below)
+// exists specifically so a fully idle player still converges onto a
+// stationary target — but that same design is what was fighting manual
+// aiming: writing 300+ times/sec from an independent trajectory that never
+// reads the player's own movement back overwrites it outright. Blending
+// from the real value instead composes with whatever the player does each
+// tick (small nudge toward target, layered on top of their own input) — the
+// actual behavior a controller/console "aim assist" has, as opposed to a
+// full auto-lock.
+static bool      g_assist_mode       = false;
 static float     g_aimbot_fov_px     = 220.0f;  // max screen-space distance (UI points) from crosshair to consider a target
 static float     g_aimbot_smooth     = 0.25f;   // 0..1 lerp factor per tick toward the target direction (lower = smoother/slower)
-static int       g_aimbot_bone       = BONE_CHEST; // which bone to aim at, when bones are available
 static bool      g_aimbot_wallcheck  = true;   // skip targets with no clear line of sight (Physics.Raycast)
-static bool      g_silent_on         = false;  // silent aim: spoof server-side rotation via Client::send_pos, screen never turns
-static int       g_silent_active     = -1;     // which of the 5 send_pos candidates actually gets the rotation override; -1 = none yet (pure observation)
-static bool      g_aim_locked_on_target = false; // true this tick when the ALREADY-APPLIED visual aim is within threshold of the current target — Auto Shoot's gate
-static bool      g_autoshoot_on         = false;
-static float     g_autoshoot_angle_thresh = 3.0f;  // degrees — how close the rendered view must already be to the target before firing
-static float     g_autoshoot_cooldown     = 0.25f; // seconds between simulated taps
-static float     g_autoshoot_offset_x     = 0.0f, g_autoshoot_offset_y = 0.0f; // calibration offset from screen center for the simulated tap
-static double    g_autoshoot_last_fire_time = 0.0;
-static long      g_autoshoot_fire_count     = 0;
+static bool      g_multipoint_on     = true;   // sample multiple points around each selected hitbox instead of only its exact center
+static int       g_multipoint_count  = 8;      // ring samples around each hitbox, 3..12
+
+// Which bones count as valid aim/trigger hitboxes — multi-select, indexed
+// directly by BoneIdx (0..14; index 9 is an unused gap in that enum and
+// always stays false). Default: chest only, matching the old single-bone
+// Combo's default.
+static bool      g_hitbox_sel[15] = { false,false,true,false, false,false,false,false,false,
+                                       false, false,false,false,false, false };
+static const int  kAllBoneIndices[] = { BONE_STOMACH, BONE_LOWERCHEST, BONE_CHEST, BONE_HEAD,
+                                         BONE_R_UPARM, BONE_R_LOARM, BONE_R_HAND, BONE_R_UPLEG, BONE_R_LOLEG,
+                                         BONE_L_UPARM, BONE_L_LOARM, BONE_L_HAND, BONE_L_UPLEG, BONE_L_LOLEG };
+static const char* kBoneNames[] = { "Stomach","Lower Chest","Chest","Head",
+                                     "R UpperArm","R LowerArm","R Hand","R UpperLeg","R LowerLeg",
+                                     "L UpperArm","L LowerArm","L Hand","L UpperLeg","L LowerLeg" };
+static const int  kAllBoneCount = 14;
+
+// Triggerbot: fires a simulated tap once the crosshair is directly on a
+// selected hitbox — independent of the visual aimbot/assist, works with
+// pure manual aiming too.
+static bool      g_trigger_on              = false;
+static float     g_trigger_radius_px       = 25.0f;  // how close to screen-center counts as "on the hitbox"
+static float     g_trigger_reaction_min_ms = 0.0f;
+static float     g_trigger_reaction_max_ms = 0.0f;
+static float     g_trigger_rapid_s         = 0.15f;  // minimum seconds between repeated shots while held on target
+static bool      g_trigger_pending         = false;
+static double    g_trigger_pending_until   = 0.0;
+static double    g_trigger_last_fire_time  = 0.0;
+static long      g_trigger_fire_count      = 0;
+static float     g_trigger_tap_x           = -1.0f, g_trigger_tap_y = -1.0f; // draggable marker; -1 = not yet placed (defaults to screen center once known)
 // Persistent aim-turn state, updated ourselves frame-to-frame instead of
 // re-reading the inputs struct's "cur" field as the slerp start point. The
 // struct's field turned out to reflect the game's own (untouched, since the
@@ -513,15 +547,19 @@ static bool find_visible_point_near(Vector3 eye, Vector3 center, float radius, V
     Vector3 up{ right.y*look.z - right.z*look.y,
                 right.z*look.x - right.x*look.z,
                 right.x*look.y - right.y*look.x };
-    static const float offs[8][2] = {
-        { 1.0f, 0.0f}, {-1.0f, 0.0f}, {0.0f, 1.0f}, {0.0f,-1.0f},
-        { 0.7f, 0.7f}, {-0.7f, 0.7f}, {0.7f,-0.7f}, {-0.7f,-0.7f},
-    };
-    for (int i = 0; i < 8; i++) {
+    // Evenly-spaced ring of g_multipoint_count samples (user-configurable,
+    // 3..12) instead of a fixed 8 — more points means finer coverage of the
+    // hitbox's edge at the cost of a few extra raycasts per candidate.
+    int n = g_multipoint_count;
+    if (n < 3) n = 3;
+    if (n > 12) n = 12;
+    for (int i = 0; i < n; i++) {
+        float ang = (2.0f * (float)M_PI) * ((float)i / (float)n);
+        float ox = cosf(ang), oy = sinf(ang);
         Vector3 p;
-        p.x = center.x + right.x*offs[i][0]*radius + up.x*offs[i][1]*radius;
-        p.y = center.y + right.y*offs[i][0]*radius + up.y*offs[i][1]*radius;
-        p.z = center.z + right.z*offs[i][0]*radius + up.z*offs[i][1]*radius;
+        p.x = center.x + right.x*ox*radius + up.x*oy*radius;
+        p.y = center.y + right.y*ox*radius + up.y*oy*radius;
+        p.z = center.z + right.z*ox*radius + up.z*oy*radius;
         if (bone_is_visible(eye, p)) { outPoint = p; return true; }
     }
     return false;
@@ -534,12 +572,10 @@ static bool find_visible_point_near(Vector3 eye, Vector3 center, float radius, V
 // name in the menu if every candidate scores 0 (rare: a brand new field
 // layout, not just a renamed one).
 static void install_aimbot_hook();  // defined below; forward-declared for use here
-static void install_silent_hook();  // defined below; forward-declared for use here
-static void maybe_autoshoot();      // defined below (needs find_game_root_view); forward-declared for use in main_pump
+static void maybe_triggerbot();     // defined below (needs find_game_root_view); forward-declared for use in main_pump
 static void resolve_all() {
     write_step(10); bind_pointers();
     install_aimbot_hook();
-    install_silent_hook();
     write_step(11); g_asmb = il2cpp_domain_assembly_open ? il2cpp_domain_assembly_open(NULL, g_asm_name) : NULL;
     write_step(12); g_img  = (g_asmb && il2cpp_assembly_get_image) ? il2cpp_assembly_get_image(g_asmb) : NULL;
     write_step(13); g_plh_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", g_plh_cls) : NULL;
@@ -1051,6 +1087,9 @@ static bool find_aim_target(void*& outCam, Vector3& outEye, Vector3& outAimPoint
     }
     const int effectiveLocalTeam = (g_local_team >= 0) ? g_local_team : autoLocalTeam;
 
+    // Multi-hitbox: try every SELECTED bone on every candidate player, and
+    // pick whichever single (player, bone) pair lands closest to the
+    // crosshair — not just one fixed bone per player anymore.
     void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{};
     for (void* obj : players) {
         if (*(bool*)((char*)obj + g_pd_local)) continue;
@@ -1060,28 +1099,37 @@ static bool find_aim_target(void*& outCam, Vector3& outEye, Vector3& outAimPoint
             int tm = *(int*)((char*)obj + g_pd_team);
             if (tm == effectiveLocalTeam) continue;
         }
-        Vector3 aimPoint, bonePos;
-        aimPoint = get_bone_pos(obj, g_aimbot_bone, bonePos) ? bonePos : *(Vector3*)((char*)obj + g_pd_pos);
 
-        Vector3 s = W2S(cam, aimPoint, NULL);
-        if (s.z <= 0.0f) continue;
-        float ux = s.x * sx, uy = g_scrH - (s.y * sy);
-        float dx = ux - cxScreen, dy = uy - cyScreen;
-        float d2 = dx*dx + dy*dy;
-        if (d2 > g_aimbot_fov_px * g_aimbot_fov_px) continue;
-        if (d2 >= bestDist2) continue;
+        for (int bi = 0; bi < kAllBoneCount; bi++) {
+            int boneIdx = kAllBoneIndices[bi];
+            if (!g_hitbox_sel[boneIdx]) continue;
+            Vector3 aimPoint;
+            if (!get_bone_pos(obj, boneIdx, aimPoint)) continue;
 
-        Vector3 finalAimPoint = aimPoint;
-        if (g_aimbot_wallcheck && Physics_Raycast) {
-            // Aim at whatever visible edge of the SELECTED bone is exposed
-            // (dead-center if clear, otherwise a sliver around it) — reject
-            // the target only if no part of that bone is visible at all.
-            Vector3 edgePoint;
-            if (!find_visible_point_near(eye, aimPoint, kBoneVisRadius, edgePoint)) continue;
-            finalAimPoint = edgePoint;
+            Vector3 s = W2S(cam, aimPoint, NULL);
+            if (s.z <= 0.0f) continue;
+            float ux = s.x * sx, uy = g_scrH - (s.y * sy);
+            float dx = ux - cxScreen, dy = uy - cyScreen;
+            float d2 = dx*dx + dy*dy;
+            if (d2 > g_aimbot_fov_px * g_aimbot_fov_px) continue;
+            if (d2 >= bestDist2) continue;
+
+            Vector3 finalAimPoint = aimPoint;
+            if (g_aimbot_wallcheck && Physics_Raycast) {
+                if (g_multipoint_on) {
+                    // Aim at whatever visible edge of this hitbox is exposed
+                    // (dead-center if clear, otherwise a sliver around it) —
+                    // reject only if no part of it is visible at all.
+                    Vector3 edgePoint;
+                    if (!find_visible_point_near(eye, aimPoint, kBoneVisRadius, edgePoint)) continue;
+                    finalAimPoint = edgePoint;
+                } else {
+                    if (!bone_is_visible(eye, aimPoint)) continue;
+                }
+            }
+
+            bestDist2 = d2; best = obj; bestAimPoint = finalAimPoint;
         }
-
-        bestDist2 = d2; best = obj; bestAimPoint = finalAimPoint;
     }
     if (!best) return false;
 
@@ -1092,18 +1140,46 @@ static bool find_aim_target(void*& outCam, Vector3& outEye, Vector3& outAimPoint
 }
 
 static void apply_aimbot(void* controller, void* inputsPtr) {
-    if (!g_aimbot_on) { g_aim_state_valid = false; g_aim_locked_on_target = false; return; }
-    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; g_aim_locked_on_target = false; return; }
+    if (!g_aimbot_on) { g_aim_state_valid = false; return; }
+    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; return; }
 
     void* cam; Vector3 eye, aimPoint;
-    if (!find_aim_target(cam, eye, aimPoint)) { g_aim_state_valid = false; g_aim_locked_on_target = false; return; }
+    if (!find_aim_target(cam, eye, aimPoint)) {
+        // RELEASE PHASE, full-lock mode only (assist mode never sets
+        // g_aim_state_valid — see below — so it never reaches here; it was
+        // already tracking the real value every tick, nothing to hand back).
+        // A hard stop the instant the target disappears meant the game's own
+        // real/manual rotation — which had kept updating underneath our
+        // override the whole time — snapped the visible camera straight back
+        // to wherever it now was, since nothing eased the gap. Instead, keep
+        // blending our own state toward the REAL current value for a few
+        // more ticks until they're close, then let go for real.
+        if (!g_aim_state_valid) return;
+        Quat* curRel = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
+        const float releaseT = 0.15f;
+        Quat released = quat_slerp(g_aim_state_quat, *curRel, releaseT);
+        g_aim_state_quat = released;
+
+        float dotv = released.x*curRel->x + released.y*curRel->y + released.z*curRel->z + released.w*curRel->w;
+        if (dotv < 0.0f) dotv = -dotv;
+        if (dotv > 1.0f) dotv = 1.0f;
+        float angleDiffDeg = 2.0f * acosf(dotv) * (180.0f / (float)M_PI);
+        if (angleDiffDeg < 0.5f) { g_aim_state_valid = false; return; } // close enough — fully let go
+
+        *curRel = released;
+        if (Tf_set_rotation) {
+            void* camTfRel = Camera_get_main ? Comp_get_tf(Camera_get_main(NULL), NULL) : NULL;
+            if (safe_ptr(camTfRel)) Tf_set_rotation(camTfRel, released, NULL);
+        }
+        return;
+    }
 
     // Pitch/yaw from eye->target, exactly matching the reference's calcAngle
     // (note: delta is eye-minus-target, not target-minus-eye — the sign
     // convention the atan2/asin below are built around).
     Vector3 d{ eye.x - aimPoint.x, eye.y - aimPoint.y, eye.z - aimPoint.z };
     float mag = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
-    if (mag < 0.001f) { g_aim_state_valid = false; g_aim_locked_on_target = false; return; }
+    if (mag < 0.001f) { g_aim_state_valid = false; return; }
     const float r2d = 180.0f / (float)M_PI;
     float pitch = asinf(d.y / mag) * r2d;
     float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
@@ -1118,34 +1194,34 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     Quat targetQ = euler_to_quat_unity(pitch, yaw, 0.0f);
     Quat* cur = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
     float t = g_aimbot_smooth; if (t < 0.02f) t = 0.02f; if (t > 1.0f) t = 1.0f;
-    // Blend from OUR OWN last output, not from *cur. *cur turned out to
-    // reflect the game's real (untouched) view each tick rather than what we
-    // wrote last frame, so blending from it recomputed the identical step
-    // from the identical baseline to the identical target every single tick
-    // — the camera turned partway toward a stationary enemy and then just
-    // froze there instead of continuing to close the gap. Seed our state
-    // from the real value only once, on acquisition, then every subsequent
-    // tick genuinely advances further from where we left off. True slerp
-    // (quat_slerp handles the double-cover shortest-path flip internally)
-    // instead of plain lerp+normalize, since nlerp's angular speed isn't
-    // constant across the arc.
-    if (!g_aim_state_valid) { g_aim_state_quat = *cur; g_aim_state_valid = true; }
 
-    // Auto Shoot's gate: compare where the camera IS ALREADY rendering
-    // (g_aim_state_quat, before this tick's step) against the target — not
-    // the post-update value, since that would fire a tick early, before the
-    // player would actually visually see the crosshair land on the enemy.
-    {
-        float dotv = g_aim_state_quat.x*targetQ.x + g_aim_state_quat.y*targetQ.y
-                   + g_aim_state_quat.z*targetQ.z + g_aim_state_quat.w*targetQ.w;
-        if (dotv < 0.0f) dotv = -dotv; // double cover
-        if (dotv > 1.0f) dotv = 1.0f;
-        float angleDiffDeg = 2.0f * acosf(dotv) * (180.0f / (float)M_PI);
-        g_aim_locked_on_target = (angleDiffDeg <= g_autoshoot_angle_thresh);
+    Quat blendFrom;
+    if (g_assist_mode) {
+        // Assist: blend from the REAL current value (*cur), which already
+        // includes whatever the player just did manually — a small nudge
+        // toward target composes with manual input on top of it, instead of
+        // fighting it. No persistent state is kept in this mode at all.
+        g_aim_state_valid = false;
+        blendFrom = *cur;
+    } else {
+        // Full lock: blend from OUR OWN last output, not from *cur. *cur
+        // reflects the game's real (untouched) view each tick rather than
+        // what we wrote last frame, so blending from it every tick would
+        // recompute the identical step from the identical baseline to the
+        // identical target — the camera would turn partway toward a
+        // stationary enemy and then just freeze instead of continuing to
+        // close the gap. Seed from the real value only once, on
+        // acquisition, then every subsequent tick genuinely advances
+        // further from where we left off.
+        if (!g_aim_state_valid) { g_aim_state_quat = *cur; g_aim_state_valid = true; }
+        blendFrom = g_aim_state_quat;
     }
 
-    Quat blended = quat_slerp(g_aim_state_quat, targetQ, t);
-    g_aim_state_quat = blended;
+    // True slerp (quat_slerp handles the double-cover shortest-path flip
+    // internally) instead of plain lerp+normalize, since nlerp's angular
+    // speed isn't constant across the arc.
+    Quat blended = quat_slerp(blendFrom, targetQ, t);
+    if (!g_assist_mode) g_aim_state_quat = blended;
     *cur = blended;
 
     // m_qCameraRotation alone didn't visibly turn the camera — it likely only
@@ -1191,92 +1267,6 @@ static void install_aimbot_hook() {
     g_aimbot_hook_installed = true;
 }
 
-// ---------------------------------------------------------------------------
-// Silent aim: Client::send_pos hook.
-//
-// CORRECTION from the previous build: it shipped hooking a single candidate
-// (MDPEDGFFIFI @ 0x34BFF90) on the claim that the reference's confirmed
-// signature — 5 floats + 1 byte — was unique across our own dump's Client
-// class. That check only scanned a truncated slice of the class body and
-// was WRONG: a full scan of the entire class (all ~960 lines) shows FIVE
-// methods share that exact signature — MDPEDGFFIFI, CMHFMKEFEEI, ONPKEPCMMGL,
-// HBOAEAHJNFK, GEPNJJFLFMG — the same 5 candidates flagged much earlier this
-// session as "signature-identical, no safe way to disambiguate". That's
-// almost certainly why silent aim didn't work: wrong candidate hooked (or a
-// candidate that's simply never invoked during normal position updates).
-//
-// Fix: hook all 5, but PASSIVELY — every hook logs its own call count and
-// last args and always calls straight through UNMODIFIED. None of the 5 get
-// their behavior altered by default, so a wrong guess costs nothing (no
-// crash/misbehavior risk, unlike blindly overriding args on the wrong one).
-// Open the menu during a live match, move around, and watch which sp[N]
-// increments continuously with rx/ry/rz values that track actual movement —
-// that's the real send_pos. Pick it via "Active candidate" in the menu, and
-// ONLY THEN does that one candidate get the rotation-override logic.
-#define SILENT_CANDIDATE_COUNT 5
-static const uintptr_t kSilentCandidateRVA[SILENT_CANDIDATE_COUNT] = {
-    0x34BFF90, 0x34C5E1C, 0x34C61A0, 0x34C8238, 0x34CE3E8
-};
-typedef void (*Client_SendPos_t)(void*, float, float, float, float, float, uint8_t, void*);
-static Client_SendPos_t Orig_Client_SendPos[SILENT_CANDIDATE_COUNT] = {NULL, NULL, NULL, NULL, NULL};
-static long   g_silent_calls[SILENT_CANDIDATE_COUNT]   = {0, 0, 0, 0, 0};
-static float  g_silent_last_rx[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
-static float  g_silent_last_ry[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
-static float  g_silent_last_rz[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
-static float  g_silent_last_lx[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
-static float  g_silent_last_ly[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
-static bool   g_silent_hook_installed = false;
-
-static void silent_candidate_tick(int idx, void* thiz, float rx, float ry, float rz, float lx, float ly, uint8_t bitmask, void* method) {
-    g_silent_calls[idx]++;
-    g_silent_last_rx[idx] = rx; g_silent_last_ry[idx] = ry; g_silent_last_rz[idx] = rz;
-    g_silent_last_lx[idx] = lx; g_silent_last_ly[idx] = ly;
-    if (g_silent_on && g_silent_active == idx) {
-        void* cam; Vector3 eye, aimPoint;
-        if (find_aim_target(cam, eye, aimPoint)) {
-            Vector3 d{ eye.x - aimPoint.x, eye.y - aimPoint.y, eye.z - aimPoint.z };
-            float mag = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
-            if (mag > 0.001f) {
-                const float r2d = 180.0f / (float)M_PI;
-                float pitch = asinf(d.y / mag) * r2d;
-                float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
-                // The reference wraps pitch into 0..360 before sending (see
-                // their send_attackv2 correction path) — the network/server
-                // rotation representation expects that range, not signed
-                // -180..180. Yaw is left as-is, matching the reference.
-                if (pitch < 0.0f) pitch += 360.0f;
-                if (Orig_Client_SendPos[idx]) { Orig_Client_SendPos[idx](thiz, rx, ry, rz, pitch, yaw, bitmask, method); return; }
-            }
-        }
-    }
-    if (Orig_Client_SendPos[idx]) Orig_Client_SendPos[idx](thiz, rx, ry, rz, lx, ly, bitmask, method);
-}
-
-#define DEFINE_SILENT_HOOK(N) \
-static void Hook_Client_SendPos_##N(void* thiz, float rx, float ry, float rz, float lx, float ly, uint8_t bitmask, void* method) { \
-    silent_candidate_tick(N, thiz, rx, ry, rz, lx, ly, bitmask, method); \
-}
-DEFINE_SILENT_HOOK(0)
-DEFINE_SILENT_HOOK(1)
-DEFINE_SILENT_HOOK(2)
-DEFINE_SILENT_HOOK(3)
-DEFINE_SILENT_HOOK(4)
-#undef DEFINE_SILENT_HOOK
-
-typedef void (*SilentHookFn_t)(void*, float, float, float, float, float, uint8_t, void*);
-static const SilentHookFn_t kSilentHookFns[SILENT_CANDIDATE_COUNT] = {
-    Hook_Client_SendPos_0, Hook_Client_SendPos_1, Hook_Client_SendPos_2,
-    Hook_Client_SendPos_3, Hook_Client_SendPos_4
-};
-
-static void install_silent_hook() {
-    if (g_silent_hook_installed || !g_image_base) return;
-    for (int i = 0; i < SILENT_CANDIDATE_COUNT; i++) {
-        void* target = (void*)(g_image_base + kSilentCandidateRVA[i]);
-        MSHookFunction(target, (void*)kSilentHookFns[i], (void**)&Orig_Client_SendPos[i]);
-    }
-    g_silent_hook_installed = true;
-}
 
 static void main_pump() {
     if (g_want_resolve) { g_want_resolve = false; resolve_all(); }
@@ -1298,7 +1288,128 @@ static void main_pump() {
     // Aimbot itself now runs from inside the SetInputs hook (installed once
     // in resolve_all), not here — see apply_aimbot's comment for why a plain
     // periodic write from this timer never survived to be used.
-    maybe_autoshoot(); // main-thread only (UIKit touch injection) — this timer already runs on the main thread
+    maybe_triggerbot(); // main-thread only (UIKit touch injection) — this timer already runs on the main thread
+}
+
+// ---------------------------------------------------------------------------
+// Config save/load — plain key=value text files in the app's own Documents
+// directory (same sandbox-writable location the Loader already caches its
+// downloaded dylib in). Deliberately not JSON: nothing here needs nested
+// structure, and a hand-rolled key=value scanner is a few lines instead of
+// pulling in a parser for something this small.
+static NSString* config_dir() {
+    NSArray* paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString* dir = [paths.firstObject stringByAppendingPathComponent:@"BlockpostESP_configs"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static std::vector<std::string> list_configs() {
+    std::vector<std::string> out;
+    NSArray* files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:config_dir() error:nil];
+    for (NSString* f in files) {
+        if ([f.pathExtension isEqualToString:@"cfg"]) {
+            out.push_back(std::string([[f stringByDeletingPathExtension] UTF8String]));
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Names only English letters + underscore, per spec — everything else is
+// silently dropped rather than rejecting the whole input, so partial typos
+// don't force a full retype.
+static std::string sanitize_config_name(const char* raw) {
+    std::string s;
+    for (const char* p = raw; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_') s += *p;
+    }
+    return s;
+}
+
+static bool save_config(const std::string& name) {
+    if (name.empty()) return false;
+    NSString* path = [config_dir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.cfg", name.c_str()]];
+    std::ofstream f([path UTF8String]);
+    if (!f.is_open()) return false;
+    f << "esp_on=" << (g_esp_on?1:0) << "\n";
+    f << "enemies_only=" << (g_enemies_only?1:0) << "\n";
+    f << "local_team=" << g_local_team << "\n";
+    f << "box_top=" << g_pd_head_off << "\n";
+    f << "box_bottom=" << g_pd_feet_off << "\n";
+    f << "skeleton=" << (g_skeleton_on?1:0) << "\n";
+    f << "show_name=" << (g_show_name?1:0) << "\n";
+    f << "show_health_bar=" << (g_show_health_bar?1:0) << "\n";
+    f << "show_health_txt=" << (g_show_health_txt?1:0) << "\n";
+    f << "show_armor_bar=" << (g_show_armor_bar?1:0) << "\n";
+    f << "show_weapon=" << (g_show_weapon?1:0) << "\n";
+    f << "aimbot_on=" << (g_aimbot_on?1:0) << "\n";
+    f << "assist_mode=" << (g_assist_mode?1:0) << "\n";
+    f << "aimbot_fov_px=" << g_aimbot_fov_px << "\n";
+    f << "aimbot_smooth=" << g_aimbot_smooth << "\n";
+    f << "aimbot_wallcheck=" << (g_aimbot_wallcheck?1:0) << "\n";
+    f << "multipoint_on=" << (g_multipoint_on?1:0) << "\n";
+    f << "multipoint_count=" << g_multipoint_count << "\n";
+    {
+        std::string bits;
+        for (int i = 0; i < 15; i++) bits += g_hitbox_sel[i] ? '1' : '0';
+        f << "hitbox_sel=" << bits << "\n";
+    }
+    f << "trigger_on=" << (g_trigger_on?1:0) << "\n";
+    f << "trigger_radius_px=" << g_trigger_radius_px << "\n";
+    f << "trigger_reaction_min_ms=" << g_trigger_reaction_min_ms << "\n";
+    f << "trigger_reaction_max_ms=" << g_trigger_reaction_max_ms << "\n";
+    f << "trigger_rapid_s=" << g_trigger_rapid_s << "\n";
+    f << "trigger_tap_x=" << g_trigger_tap_x << "\n";
+    f << "trigger_tap_y=" << g_trigger_tap_y << "\n";
+    return true;
+}
+
+static bool load_config(const std::string& name) {
+    if (name.empty()) return false;
+    NSString* path = [config_dir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.cfg", name.c_str()]];
+    std::ifstream f([path UTF8String]);
+    if (!f.is_open()) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq), val = line.substr(eq + 1);
+        if (val.empty()) continue;
+        if (key=="esp_on") g_esp_on = (val=="1");
+        else if (key=="enemies_only") g_enemies_only = (val=="1");
+        else if (key=="local_team") g_local_team = atoi(val.c_str());
+        else if (key=="box_top") g_pd_head_off = (float)atof(val.c_str());
+        else if (key=="box_bottom") g_pd_feet_off = (float)atof(val.c_str());
+        else if (key=="skeleton") g_skeleton_on = (val=="1");
+        else if (key=="show_name") g_show_name = (val=="1");
+        else if (key=="show_health_bar") g_show_health_bar = (val=="1");
+        else if (key=="show_health_txt") g_show_health_txt = (val=="1");
+        else if (key=="show_armor_bar") g_show_armor_bar = (val=="1");
+        else if (key=="show_weapon") g_show_weapon = (val=="1");
+        else if (key=="aimbot_on") g_aimbot_on = (val=="1");
+        else if (key=="assist_mode") g_assist_mode = (val=="1");
+        else if (key=="aimbot_fov_px") g_aimbot_fov_px = (float)atof(val.c_str());
+        else if (key=="aimbot_smooth") g_aimbot_smooth = (float)atof(val.c_str());
+        else if (key=="aimbot_wallcheck") g_aimbot_wallcheck = (val=="1");
+        else if (key=="multipoint_on") g_multipoint_on = (val=="1");
+        else if (key=="multipoint_count") g_multipoint_count = atoi(val.c_str());
+        else if (key=="hitbox_sel") { for (int i=0;i<15 && i<(int)val.size();i++) g_hitbox_sel[i] = (val[i]=='1'); }
+        else if (key=="trigger_on") g_trigger_on = (val=="1");
+        else if (key=="trigger_radius_px") g_trigger_radius_px = (float)atof(val.c_str());
+        else if (key=="trigger_reaction_min_ms") g_trigger_reaction_min_ms = (float)atof(val.c_str());
+        else if (key=="trigger_reaction_max_ms") g_trigger_reaction_max_ms = (float)atof(val.c_str());
+        else if (key=="trigger_rapid_s") g_trigger_rapid_s = (float)atof(val.c_str());
+        else if (key=="trigger_tap_x") g_trigger_tap_x = (float)atof(val.c_str());
+        else if (key=="trigger_tap_y") g_trigger_tap_y = (float)atof(val.c_str());
+    }
+    return true;
+}
+
+static bool remove_config(const std::string& name) {
+    if (name.empty()) return false;
+    NSString* path = [config_dir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.cfg", name.c_str()]];
+    return [[NSFileManager defaultManager] removeItemAtPath:path error:nil] ? true : false;
 }
 
 // Menu visibility, toggled by a 3-finger double-tap anywhere on screen (see
@@ -1318,144 +1429,123 @@ static void render_frame(float screenW, float screenH) {
         ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         rects.push_back(CGRectMake(wp.x, wp.y, ws.x, ws.y));
 
-        ImGui::Checkbox("ESP", &g_esp_on); ImGui::SameLine();
-        // BotAI has no known team offset (g_off_team==0) so "enemies only"
-        // is a silent no-op in that mode — grey it out instead of pretending
-        // it works, rather than leave it clickable-but-broken.
-        bool enemiesOnlyUsable = (g_esp_src == 1) || (g_off_team != 0);
-        ImGui::BeginDisabled(!enemiesOnlyUsable);
-        ImGui::Checkbox("Enemies only", &g_enemies_only);
-        ImGui::EndDisabled();
-        if (!enemiesOnlyUsable) { ImGui::SameLine(); ImGui::TextDisabled("(no team data in BotAI mode)"); }
-        ImGui::RadioButton("PLH players (real)", &g_esp_src, 1); ImGui::SameLine();
-        ImGui::RadioButton("FindObjectsOfType", &g_esp_src, 0);
-        ImGui::InputInt("Local team", &g_local_team);
-        if (g_esp_src == 1) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(auto=%d, -1 uses auto)", g_auto_local_team_display);
-        }
-        if (g_esp_src == 1) {
-            ImGui::SliderFloat("Box top",   &g_pd_head_off, -1.0f, 3.0f);
-            ImGui::SliderFloat("Box bottom",&g_pd_feet_off, -3.0f, 1.0f);
-            ImGui::SameLine();
-            if (ImGui::Button("Reset##pd")) { g_pd_head_off = 1.6f; g_pd_feet_off = -0.1f; }
-        } else {
-            ImGui::SliderFloat("Box top",   &g_head_off, -3.0f, 3.0f);
-            ImGui::SliderFloat("Box bottom",&g_feet_off, -3.0f, 3.0f);
-            ImGui::SameLine();
-            if (ImGui::Button("Reset##bot")) { g_head_off = 0.2f; g_feet_off = -1.9f; }
-        }
-        if (g_esp_src != 1) ImGui::SliderFloat("Box width", &g_width_mult, 0.1f, 1.0f);
+        if (ImGui::BeginTabBar("##tabs")) {
+            if (ImGui::BeginTabItem("Visual")) {
+                ImGui::Checkbox("ESP", &g_esp_on);
+                ImGui::SameLine();
+                ImGui::Checkbox("Enemies only", &g_enemies_only);
+                ImGui::InputInt("Local team", &g_local_team);
+                ImGui::SameLine(); ImGui::TextDisabled("(auto=%d, -1 uses auto)", g_auto_local_team_display);
+                ImGui::SliderFloat("Box top",    &g_pd_head_off, -1.0f, 3.0f);
+                ImGui::SliderFloat("Box bottom", &g_pd_feet_off, -3.0f, 1.0f);
+                ImGui::SameLine();
+                if (ImGui::Button("Reset##box")) { g_pd_head_off = 1.6f; g_pd_feet_off = -0.1f; }
+                ImGui::Checkbox("Skeleton (real bones)", &g_skeleton_on);
+                ImGui::Checkbox("Name", &g_show_name); ImGui::SameLine();
+                ImGui::Checkbox("Health bar", &g_show_health_bar); ImGui::SameLine();
+                ImGui::Checkbox("Health text", &g_show_health_txt);
+                ImGui::Checkbox("Armor bar", &g_show_armor_bar); ImGui::SameLine();
+                ImGui::Checkbox("Weapon name", &g_show_weapon);
+                ImGui::EndTabItem();
+            }
 
-        if (g_esp_src == 1) {
-            ImGui::Checkbox("Skeleton (real bones)", &g_skeleton_on);
-            ImGui::SameLine(); ImGui::TextDisabled("(PLH only)");
-            ImGui::Checkbox("Name", &g_show_name); ImGui::SameLine();
-            ImGui::Checkbox("Health bar", &g_show_health_bar); ImGui::SameLine();
-            ImGui::Checkbox("Health text", &g_show_health_txt);
-            ImGui::Checkbox("Armor bar", &g_show_armor_bar); ImGui::SameLine();
-            ImGui::Checkbox("Weapon name", &g_show_weapon);
+            if (ImGui::BeginTabItem("Combat")) {
+                ImGui::SeparatorText("Aimbot");
+                ImGui::Checkbox("Aimbot (visual)", &g_aimbot_on);
+                ImGui::Checkbox("Assist mode", &g_assist_mode);
+                ImGui::SameLine(); ImGui::TextDisabled("(nudges toward target, composes with manual aim instead of overriding it)");
+                ImGui::SliderFloat("FOV (px)", &g_aimbot_fov_px, 20.0f, 600.0f);
+                ImGui::SliderFloat("Smoothness", &g_aimbot_smooth, 0.02f, 1.0f);
+                ImGui::SameLine(); ImGui::TextDisabled("(low=slow, 1=instant snap)");
+                ImGui::Checkbox("Wallcheck", &g_aimbot_wallcheck);
 
-            ImGui::SeparatorText("Aimbot");
-            ImGui::Checkbox("Aimbot (visual)", &g_aimbot_on);
-            ImGui::SameLine(); ImGui::TextDisabled("(turns the camera)");
-            ImGui::Checkbox("Silent aim", &g_silent_on);
-            ImGui::SameLine(); ImGui::TextDisabled("(server-side only, screen never turns)");
-            {
-                static const char* candNames[] = {"none (observe only)","0","1","2","3","4"};
-                int candSel = g_silent_active + 1;
-                if (ImGui::Combo("send_pos candidate", &candSel, candNames, 6)) g_silent_active = candSel - 1;
-                ImGui::SameLine(); ImGui::TextDisabled("(pick after watching calls below while moving)");
-                for (int i = 0; i < SILENT_CANDIDATE_COUNT; i++) {
-                    ImGui::Text("sp[%d] calls=%ld rx=%.1f ry=%.1f rz=%.1f lx=%.1f ly=%.1f",
-                                i, g_silent_calls[i], g_silent_last_rx[i], g_silent_last_ry[i],
-                                g_silent_last_rz[i], g_silent_last_lx[i], g_silent_last_ly[i]);
+                ImGui::SeparatorText("Multipoints");
+                ImGui::Checkbox("Enabled##mp", &g_multipoint_on);
+                ImGui::SameLine(); ImGui::TextDisabled("(aim at a visible edge of the hitbox, not just dead-center)");
+                ImGui::SliderInt("Point count", &g_multipoint_count, 3, 12);
+
+                ImGui::SeparatorText("Hitboxes");
+                if (ImGui::Button("Select all")) { for (int i = 0; i < kAllBoneCount; i++) g_hitbox_sel[kAllBoneIndices[i]] = true; }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear")) { for (int i = 0; i < kAllBoneCount; i++) g_hitbox_sel[kAllBoneIndices[i]] = false; }
+                for (int i = 0; i < kAllBoneCount; i++) {
+                    ImGui::Checkbox(kBoneNames[i], &g_hitbox_sel[kAllBoneIndices[i]]);
+                    if ((i % 2) == 0 && i + 1 < kAllBoneCount) ImGui::SameLine();
                 }
+
+                ImGui::SeparatorText("Triggerbot");
+                ImGui::Checkbox("Triggerbot", &g_trigger_on);
+                ImGui::SameLine(); ImGui::TextDisabled("(independent of Aimbot — works with manual aim too)");
+                ImGui::SliderFloat("Trigger radius (px)", &g_trigger_radius_px, 5.0f, 80.0f);
+                ImGui::SliderFloat("Reaction min (ms)", &g_trigger_reaction_min_ms, 0.0f, 1000.0f);
+                ImGui::SliderFloat("Reaction max (ms)", &g_trigger_reaction_max_ms, 0.0f, 1000.0f);
+                ImGui::SameLine(); ImGui::TextDisabled("(both 0 = instant, no recheck)");
+                ImGui::SliderFloat("Rapid (s between shots)", &g_trigger_rapid_s, 0.03f, 1.0f);
+                ImGui::Text("pending=%d  fired=%ld", g_trigger_pending ? 1 : 0, g_trigger_fire_count);
+                if (g_trigger_on) ImGui::TextDisabled("Drag the red marker on screen onto the fire button/zone.");
+                ImGui::EndTabItem();
             }
-            ImGui::SliderFloat("FOV (px)", &g_aimbot_fov_px, 20.0f, 600.0f);
-            ImGui::SliderFloat("Smoothness (visual)", &g_aimbot_smooth, 0.02f, 1.0f);
-            ImGui::SameLine(); ImGui::TextDisabled("(low=slow/smooth, 1=instant snap)");
-            static const char* boneNames[] = {"stomach","lowerChest","chest","head"};
-            static int boneSel = 2; // chest default
-            if (ImGui::Combo("Aim bone", &boneSel, boneNames, 4)) {
-                static const int boneVals[] = {BONE_STOMACH, BONE_LOWERCHEST, BONE_CHEST, BONE_HEAD};
-                g_aimbot_bone = boneVals[boneSel];
+
+            if (ImGui::BeginTabItem("Config")) {
+                static char cfgName[64] = "";
+                static std::vector<std::string> cfgList;
+                static int cfgSel = -1;
+                static std::string cfgStatus;
+                static bool cfgListLoaded = false;
+                if (!cfgListLoaded) { cfgList = list_configs(); cfgListLoaded = true; }
+
+                ImGui::InputText("Name", cfgName, sizeof(cfgName));
+                ImGui::SameLine(); ImGui::TextDisabled("(a-z, A-Z, _ only)");
+
+                if (ImGui::Button("Create")) {
+                    std::string clean = sanitize_config_name(cfgName);
+                    if (clean.empty()) cfgStatus = "empty name";
+                    else {
+                        bool exists = false;
+                        for (auto& c : cfgList) if (c == clean) exists = true;
+                        if (exists) cfgStatus = "\"" + clean + "\" already exists — use Save to overwrite";
+                        else if (save_config(clean)) { cfgList = list_configs(); cfgStatus = "created " + clean; }
+                        else cfgStatus = "failed to create";
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Save")) {
+                    std::string target = (cfgSel >= 0 && cfgSel < (int)cfgList.size()) ? cfgList[cfgSel] : sanitize_config_name(cfgName);
+                    if (target.empty()) cfgStatus = "no config selected/named";
+                    else if (save_config(target)) { cfgList = list_configs(); cfgStatus = "saved " + target; }
+                    else cfgStatus = "failed to save";
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Load")) {
+                    if (cfgSel >= 0 && cfgSel < (int)cfgList.size()) {
+                        cfgStatus = load_config(cfgList[cfgSel]) ? ("loaded " + cfgList[cfgSel]) : "failed to load";
+                    } else cfgStatus = "select a config first";
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Remove")) {
+                    if (cfgSel >= 0 && cfgSel < (int)cfgList.size()) {
+                        std::string removed = cfgList[cfgSel];
+                        if (remove_config(removed)) { cfgList = list_configs(); cfgSel = -1; cfgStatus = "removed " + removed; }
+                        else cfgStatus = "failed to remove";
+                    } else cfgStatus = "select a config first";
+                }
+
+                if (!cfgStatus.empty()) ImGui::TextDisabled("%s", cfgStatus.c_str());
+
+                ImGui::SeparatorText("Saved configs");
+                for (int i = 0; i < (int)cfgList.size(); i++) {
+                    bool selected = (cfgSel == i);
+                    if (ImGui::Selectable(cfgList[i].c_str(), selected)) {
+                        cfgSel = i;
+                        strncpy(cfgName, cfgList[i].c_str(), sizeof(cfgName) - 1);
+                        cfgName[sizeof(cfgName) - 1] = 0;
+                    }
+                }
+                if (cfgList.empty()) ImGui::TextDisabled("(none yet)");
+                ImGui::EndTabItem();
             }
-            ImGui::Checkbox("Wallcheck", &g_aimbot_wallcheck);
-            ImGui::SameLine(); ImGui::TextDisabled("(skip targets with no clear line of sight)");
-
-            ImGui::SeparatorText("Auto Shoot (experimental)");
-            ImGui::Checkbox("Auto Shoot", &g_autoshoot_on);
-            ImGui::SameLine(); ImGui::TextDisabled("(fires only once visual aim is ON target)");
-            ImGui::SliderFloat("Lock threshold (deg)", &g_autoshoot_angle_thresh, 0.5f, 15.0f);
-            ImGui::SliderFloat("Cooldown (s)", &g_autoshoot_cooldown, 0.05f, 1.0f);
-            ImGui::SliderFloat("Tap offset X", &g_autoshoot_offset_x, -300.0f, 300.0f);
-            ImGui::SliderFloat("Tap offset Y", &g_autoshoot_offset_y, -300.0f, 300.0f);
-            ImGui::Text("locked=%d  fired=%ld", g_aim_locked_on_target ? 1 : 0, g_autoshoot_fire_count);
-            ImGui::SameLine(); ImGui::TextDisabled("(needs visual Aimbot ON; uses private UITouch API, may need offset tuning)");
+            ImGui::EndTabBar();
         }
-
-        if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {
-            ImGui::InputText("image", g_image_name, sizeof(g_image_name));
-            ImGui::InputText("namespace", g_target_ns, sizeof(g_target_ns));
-            ImGui::InputText("class", g_target_cls, sizeof(g_target_cls));
-            ImGui::RadioButton("pos: field", &g_pos_mode, 0); ImGui::SameLine();
-            ImGui::RadioButton("pos: get_transform()", &g_pos_mode, 1);
-            ImGui::InputScalar("tf off",   ImGuiDataType_U64, &g_off_tf,   0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            ImGui::InputScalar("team off", ImGuiDataType_U64, &g_off_team, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            if (ImGui::Button("Apply / Re-resolve")) g_want_resolve = true;
-            ImGui::SameLine();
-            if (ImGui::Button("Target = Player")) {
-                strcpy(g_target_cls, "Player"); g_target_ns[0] = 0;
-                g_pos_mode = 1;               // Player: position via get_transform()
-                g_want_resolve = true;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Target = BotAI")) {
-                strcpy(g_target_cls, "BotAI"); g_target_ns[0] = 0;
-                g_pos_mode = 1; g_off_tf = 0x20;   // get_transform() is the confirmed-correct anchor
-                g_want_resolve = true;
-            }
-        }
-
-        ImGui::SeparatorText("State");
-        if (ImGui::Button("RESOLVE il2cpp (tap in-game)")) g_want_resolve = true;
-        ImGui::Text("resolved=%d step=%d attached=%d", g_resolved ? 1 : 0, g_resolve_step, g_attached ? 1 : 0);
-        ImGui::Text("PREV RUN reached step=%d", g_prev_step);
-        ImGui::TextDisabled("(10 bind,11 asm_open,12 img,13 PLHcls,14 fld,15 type,16 ecc_type,17 done)");
-        ImGui::InputText("assembly", g_asm_name, sizeof(g_asm_name));
-        ImGui::Text("base=0x%lx", (unsigned long)g_image_base);
-        ImGui::Text("dom=%p asmb=%p", g_dom, g_asmb);
-        ImGui::Text("img=%p type_obj=%p", g_img, g_type_obj);
-        ImGui::Text("PLH klass=%p fld=%p (auto: %s, score=%d)", g_plh_klass, g_plh_fld, g_plh_field, g_plh_field_score);
-        ImGui::Text("PLH players now=%d  boxes=%d", g_plh_count, (int)g_boxes.size());
-        ImGui::Text("aimbot controller type_obj=%p hook_installed=%d", g_ecc_type_obj, g_aimbot_hook_installed);
-        {
-            std::lock_guard<std::mutex> l(g_calib_mtx);
-            if (g_calib.valid)
-                ImGui::Text("CALIB yellow=(%.0f,%.0f) cyan=(%.0f,%.0f) [1 unit = %.1fpx]",
-                             g_calib.x0, g_calib.y0, g_calib.x1, g_calib.y1, g_calib.y0 - g_calib.y1);
-            else
-                ImGui::TextDisabled("CALIB: no target in view");
-        }
-
-        if (ImGui::CollapsingHeader("PlayerData offsets")) {
-            ImGui::InputText("PLH class", g_plh_cls, sizeof(g_plh_cls));
-            ImGui::InputText("PLH field (array)", g_plh_field, sizeof(g_plh_field));
-            ImGui::InputScalar("Pos",    ImGuiDataType_U64, &g_pd_pos,    0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            ImGui::InputScalar("health", ImGuiDataType_U64, &g_pd_health, 0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            ImGui::InputScalar("team",   ImGuiDataType_U64, &g_pd_team,   0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            ImGui::InputScalar("local",  ImGuiDataType_U64, &g_pd_local,  0,0,"%lx", ImGuiInputTextFlags_CharsHexadecimal);
-            if (ImGui::Button("Re-resolve PLH field")) g_want_replh = true;  // main-thread pump does the actual call
-        }
-
-        ImGui::SeparatorText("Self-test / offset explorer");
-        ImGui::Checkbox("2. class names", &g_dbg_names);
-        ImGui::Checkbox("3. positions", &g_dbg_pos);
-        ImGui::Checkbox("4. project (W2S)", &g_dbg_w2s);
-
-        if (ImGui::Button("Copy Debug (probe + scan)")) g_want_debug = true;
-        ImGui::SameLine(); ImGui::TextDisabled("(-> paste to Nyx)");
     }
     ImGui::End();
     } // g_menu_open
@@ -1463,6 +1553,36 @@ static void render_frame(float screenW, float screenH) {
     // Publish display size for the main-thread pump, then DRAW cached boxes.
     // No il2cpp/game reads happen on this (render) thread anymore.
     g_scrW = screenW; g_scrH = screenH;
+    if (g_trigger_tap_x < 0.0f && g_scrW > 0) { g_trigger_tap_x = g_scrW * 0.5f; g_trigger_tap_y = g_scrH * 0.5f; }
+
+    // Draggable triggerbot tap-point marker — visible (and calibratable)
+    // even with the settings menu closed, since you need to see the actual
+    // game UI underneath to line it up with the real fire button/zone.
+    if (g_trigger_on && g_scrW > 0 && g_scrH > 0) {
+        ImGui::SetNextWindowPos(ImVec2(g_trigger_tap_x - 22, g_trigger_tap_y - 22), ImGuiCond_Once);
+        ImGui::SetNextWindowSize(ImVec2(44, 44), ImGuiCond_Always);
+        ImGui::Begin("##triggerpoint", nullptr,
+                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+        {
+            ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+            rects.push_back(CGRectMake(wp.x, wp.y, ws.x, ws.y));
+            if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+                ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
+                wp.x += dd.x; wp.y += dd.y;
+                ImGui::SetWindowPos(wp);
+            }
+            g_trigger_tap_x = wp.x + ws.x * 0.5f;
+            g_trigger_tap_y = wp.y + ws.y * 0.5f;
+            ImDrawList* dlm = ImGui::GetWindowDrawList();
+            ImVec2 c(wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f);
+            dlm->AddCircle(c, 18.0f, IM_COL32(255, 60, 60, 255), 24, 3.0f);
+            dlm->AddLine(ImVec2(c.x - 24, c.y), ImVec2(c.x + 24, c.y), IM_COL32(255, 60, 60, 200), 2.0f);
+            dlm->AddLine(ImVec2(c.x, c.y - 24), ImVec2(c.x, c.y + 24), IM_COL32(255, 60, 60, 200), 2.0f);
+        }
+        ImGui::End();
+    }
     {
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         std::lock_guard<std::mutex> l(g_boxes_mtx);
@@ -1712,15 +1832,100 @@ static void inject_tap(CGPoint point) {
     });
 }
 
-static void maybe_autoshoot() {
-    if (!g_autoshoot_on || !g_aimbot_on || !g_aim_locked_on_target) return;
-    if (g_scrW <= 0 || g_scrH <= 0) return;
+// Triggerbot's own condition check, deliberately independent of the visual
+// aimbot/assist state — works with pure manual aiming too, exactly like a
+// standalone triggerbot should. Projects every SELECTED hitbox on every
+// valid enemy to screen space and checks whether ANY of them sits within
+// g_trigger_radius_px of the crosshair (screen center).
+static bool crosshair_on_selected_hitbox() {
+    if (!g_resolved || !W2S || !Camera_get_main) return false;
+    void* cam = Camera_get_main(NULL);
+    if (!cam) return false;
+    float gameW = Camera_get_pixelWidth  ? (float)Camera_get_pixelWidth(cam, NULL)  : g_scrW;
+    float gameH = Camera_get_pixelHeight ? (float)Camera_get_pixelHeight(cam, NULL) : g_scrH;
+    if (gameW <= 0) gameW = g_scrW;
+    if (gameH <= 0) gameH = g_scrH;
+    if (g_scrW <= 0 || g_scrH <= 0 || gameW <= 0 || gameH <= 0) return false;
+    const float sx = g_scrW / gameW, sy = g_scrH / gameH;
+    const float cxScreen = g_scrW * 0.5f, cyScreen = g_scrH * 0.5f;
+
+    std::vector<void*> players;
+    enum_plh_players(players);
+    int autoLocalTeam = -1;
+    for (void* obj : players) {
+        if (*(bool*)((char*)obj + g_pd_local)) { autoLocalTeam = *(int*)((char*)obj + g_pd_team); break; }
+    }
+    const int effectiveLocalTeam = (g_local_team >= 0) ? g_local_team : autoLocalTeam;
+
+    for (void* obj : players) {
+        if (*(bool*)((char*)obj + g_pd_local)) continue;
+        int hp = *(int*)((char*)obj + g_pd_health);
+        if (hp <= 0) continue;
+        if (g_enemies_only && effectiveLocalTeam >= 0) {
+            int tm = *(int*)((char*)obj + g_pd_team);
+            if (tm == effectiveLocalTeam) continue;
+        }
+        for (int bi = 0; bi < kAllBoneCount; bi++) {
+            int boneIdx = kAllBoneIndices[bi];
+            if (!g_hitbox_sel[boneIdx]) continue;
+            Vector3 p;
+            if (!get_bone_pos(obj, boneIdx, p)) continue;
+            Vector3 s = W2S(cam, p, NULL);
+            if (s.z <= 0.0f) continue;
+            float ux = s.x * sx, uy = g_scrH - (s.y * sy);
+            float dx = ux - cxScreen, dy = uy - cyScreen;
+            if (dx*dx + dy*dy <= g_trigger_radius_px * g_trigger_radius_px) return true;
+        }
+    }
+    return false;
+}
+
+static void maybe_triggerbot() {
+    if (!g_trigger_on) { g_trigger_pending = false; return; }
+    if (g_scrW <= 0 || g_scrH <= 0) { g_trigger_pending = false; return; }
+
+    bool onTarget = crosshair_on_selected_hitbox();
     double now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - g_autoshoot_last_fire_time < g_autoshoot_cooldown) return;
-    g_autoshoot_last_fire_time = now;
-    g_autoshoot_fire_count++;
-    CGPoint p = CGPointMake(g_scrW * 0.5f + g_autoshoot_offset_x, g_scrH * 0.5f + g_autoshoot_offset_y);
-    inject_tap(p);
+
+    if (!onTarget) { g_trigger_pending = false; return; }
+
+    // Rapid-fire floor: don't fire faster than this even across separate
+    // acquisitions, not just within one hold.
+    if (now - g_trigger_last_fire_time < g_trigger_rapid_s) return;
+
+    CGPoint tapPoint = CGPointMake(g_trigger_tap_x, g_trigger_tap_y);
+
+    if (!g_trigger_pending) {
+        // Just acquired: arm the (possibly randomized) reaction-time wait.
+        float minMs = g_trigger_reaction_min_ms;
+        float maxMs = g_trigger_reaction_max_ms;
+        if (maxMs < minMs) maxMs = minMs;
+        float ms = minMs;
+        if (maxMs > minMs) ms += (arc4random_uniform(10001) / 10000.0f) * (maxMs - minMs);
+        if (ms <= 0.0f) {
+            // reaction=0: fire immediately, no recheck needed — matches
+            // "если делай стоит 0 можешь не проверять".
+            g_trigger_last_fire_time = now;
+            g_trigger_fire_count++;
+            inject_tap(tapPoint);
+            return;
+        }
+        g_trigger_pending = true;
+        g_trigger_pending_until = now + (ms / 1000.0);
+        return;
+    }
+
+    if (now >= g_trigger_pending_until) {
+        // Reaction time elapsed AND onTarget is still true right now (the
+        // early-return above already handles "no longer on target" by
+        // resetting g_trigger_pending) — this IS the recheck: still on the
+        // selected hitbox → shoot, otherwise this line is simply never
+        // reached this tick.
+        g_trigger_pending = false;
+        g_trigger_last_fire_time = now;
+        g_trigger_fire_count++;
+        inject_tap(tapPoint);
+    }
 }
 
 static ESPWindow*   g_window   = nil;
@@ -1799,19 +2004,21 @@ static void setup_overlay() {
 // ---------------------------------------------------------------------------
 %ctor {
     // Bind pointers (safe) and raise the overlay first, so the menu appears
-    // even if something below goes wrong. Resolve+hook-install used to be a
-    // manual button-press (originally to protect against an early-runtime
-    // crash risk that's since been fixed) — now auto-triggered a few seconds
-    // later on the SAME main-thread pump the button used, since forgetting to
-    // tap it was turning into its own recurring failure mode. The button
-    // still works too, for re-resolving after switching targets.
+    // even if something below goes wrong. Resolve+hook-install fully
+    // automatic now: a single delayed attempt used to need a manual
+    // button-mash to retry whenever it landed too early (e.g. game state not
+    // ready yet at t=6s) — replaced with a repeating timer that keeps
+    // re-triggering resolve every 2s until g_resolved actually goes true,
+    // then stops itself. No user interaction needed at all.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         bind_pointers();
         setup_overlay();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+        __block NSTimer* retryTimer = nil;
+        retryTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer* t) {
+            if (g_resolved) { [t invalidate]; return; }
             g_want_resolve = true;
-        });
+        }];
+        (void)retryTimer;
     });
 }

@@ -224,6 +224,21 @@ static bool      g_aimbot_used_bone   = false; // did the FINAL picked target us
 static float     g_aimbot_last_pitch  = 0, g_aimbot_last_yaw = 0;
 static Vector3   g_aimbot_last_eye{}, g_aimbot_last_aimpoint{};
 static int       g_aimbot_candidates  = 0;   // how many passed health/team/FOV before wallcheck
+static int       g_aimbot_probe_used  = 0;   // last-tick: final target was re-aimed to a multipoint fallback bone (selected bone was blocked, another wasn't)
+// Persistent aim-turn state, updated ourselves frame-to-frame instead of
+// re-reading the inputs struct's "cur" field as the slerp start point. The
+// struct's field turned out to reflect the game's own (untouched, since the
+// player isn't moving their finger) view each tick rather than our previous
+// write — so blending from it every frame recomputed the SAME step from the
+// SAME baseline to the SAME target and just froze partway there instead of
+// continuing to converge. Blending from our own last output instead makes
+// each tick a genuine step further along, so a stationary target actually
+// gets walked all the way onto over successive frames. Reset to invalid
+// whenever we don't have a live target this tick, so re-acquiring one
+// reseeds cleanly from the real current view instead of slerping from a
+// stale value that might now point somewhere unrelated.
+static Quat      g_aim_state_quat{};
+static bool      g_aim_state_valid    = false;
 
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
@@ -446,6 +461,38 @@ static bool get_base_pos(void* pd, Vector3& outPos) {
     outPos = Tf_get_pos(tr, NULL);
     return true;
 }
+
+// Line-of-sight check for one specific world point, used both for the
+// selected aim bone and for the multipoint fallback scan below. The margin
+// excluded from the very end of the ray (so the target's OWN collider isn't
+// what the raycast hits) used to be a PERCENTAGE of total distance
+// (dist*0.92f) — that's the actual bug behind "raycast says clear but you
+// can see a wall in front of the head, only an arm pokes out": for a target
+// 20 units away, 8% is 1.6 world units, so any wall sitting within that
+// last 1.6 units of the target (i.e. a thin wall right behind/beside them)
+// fell inside the excluded zone and was never actually tested. A FIXED
+// small margin (world units, not distance-scaled) closes that hole at any
+// range.
+static bool bone_is_visible(Vector3 eye, Vector3 point) {
+    if (!g_aimbot_wallcheck || !Physics_Raycast) return true;
+    Vector3 toTarget{ point.x - eye.x, point.y - eye.y, point.z - eye.z };
+    float dist = sqrtf(toTarget.x*toTarget.x + toTarget.y*toTarget.y + toTarget.z*toTarget.z);
+    if (dist <= 0.01f) return true;
+    Vector3 rayDir{ toTarget.x/dist, toTarget.y/dist, toTarget.z/dist };
+    const float kTargetSkin = 0.25f; // fixed world-unit margin, not a % of dist
+    float castDist = dist - kTargetSkin;
+    if (castDist < 0.01f) castDist = 0.01f;
+    return Physics_Raycast(eye, rayDir, castDist, ~0, NULL) == 0;
+}
+
+// Multipoint visibility fallback set: if the SELECTED aim bone is blocked,
+// try these before giving up on the target entirely — mirrors how a human
+// would still shoot whatever part of the enemy is actually poking out from
+// behind cover instead of freezing because the one bone we insisted on
+// (usually the head) happens to be the part that's hidden this instant.
+static const int kAimProbeBones[] = { BONE_HEAD, BONE_CHEST, BONE_LOWERCHEST, BONE_STOMACH,
+                                       BONE_R_UPARM, BONE_L_UPARM, BONE_R_HAND, BONE_L_HAND };
+static const int kAimProbeCount = (int)(sizeof(kAimProbeBones) / sizeof(kAimProbeBones[0]));
 
 // Resolve exactly like the Android source: NO il2cpp_domain_get (that hung),
 // NO thread_attach. Then AUTO-PICK whichever candidate PLH field actually
@@ -933,17 +980,17 @@ static Quat quat_slerp(Quat a, Quat b, float t) {
 }
 
 static void apply_aimbot(void* controller, void* inputsPtr) {
-    if (!g_aimbot_on || !g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) return;
-    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) return;
+    if (!g_aimbot_on || !g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) { g_aim_state_valid = false; return; }
+    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; return; }
 
     void* cam = Camera_get_main(NULL);
-    if (!cam) return;
+    if (!cam) { g_aim_state_valid = false; return; }
 
     float gameW = Camera_get_pixelWidth  ? (float)Camera_get_pixelWidth(cam, NULL)  : g_scrW;
     float gameH = Camera_get_pixelHeight ? (float)Camera_get_pixelHeight(cam, NULL) : g_scrH;
     if (gameW <= 0) gameW = g_scrW;
     if (gameH <= 0) gameH = g_scrH;
-    if (g_scrW <= 0 || g_scrH <= 0 || gameW <= 0 || gameH <= 0) return;
+    if (g_scrW <= 0 || g_scrH <= 0 || gameW <= 0 || gameH <= 0) { g_aim_state_valid = false; return; }
     const float sx = g_scrW / gameW, sy = g_scrH / gameH;
     const float cxScreen = g_scrW * 0.5f, cyScreen = g_scrH * 0.5f;
 
@@ -970,7 +1017,7 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     if (haveRealEye) eye = Tf_get_pos(camTf, NULL);
     if (!haveRealEye) {
         void* ctrlTf = Comp_get_tf(controller, NULL);
-        if (!safe_ptr(ctrlTf)) return;
+        if (!safe_ptr(ctrlTf)) { g_aim_state_valid = false; return; }
         eye = Tf_get_pos(ctrlTf, NULL);
         eye.y += g_aimbot_eye_off;
     }
@@ -985,7 +1032,7 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         g_raycast_floor_test = -1;
     }
     int blockedCount = 0;
-    int boneHits = 0, boneMisses = 0, candidates = 0;
+    int boneHits = 0, boneMisses = 0, candidates = 0, probeUsed = 0;
 
     void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{}; bool bestUsedBone = false;
     for (void* obj : players) {
@@ -1001,6 +1048,10 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         if (usedBone) { aimPoint = bonePos; boneHits++; }
         else { aimPoint = *(Vector3*)((char*)obj + g_pd_pos); boneMisses++; }
 
+        // FOV/priority screening always uses the SELECTED bone's screen
+        // position (crosshair distance) — multipoint only kicks in below,
+        // for the visibility test, so switching which bone is exposed never
+        // changes which enemy gets picked, only whether the pick is honored.
         Vector3 s = W2S(cam, aimPoint, NULL);
         if (s.z <= 0.0f) continue;
         float ux = s.x * sx, uy = g_scrH - (s.y * sy);
@@ -1010,24 +1061,33 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         candidates++;
         if (d2 >= bestDist2) continue;
 
+        Vector3 finalAimPoint = aimPoint;
+        bool usedProbe = false;
         if (g_aimbot_wallcheck && Physics_Raycast) {
-            Vector3 toTarget; toTarget.x = aimPoint.x - eye.x; toTarget.y = aimPoint.y - eye.y; toTarget.z = aimPoint.z - eye.z;
-            float dist = sqrtf(toTarget.x*toTarget.x + toTarget.y*toTarget.y + toTarget.z*toTarget.z);
-            if (dist > 0.01f) {
-                // Raycast just short of the target: if something solid blocks
-                // that shortened path, it's a wall (the target itself sits
-                // just beyond this range, so its own collider is excluded).
-                Vector3 rayDir{ toTarget.x/dist, toTarget.y/dist, toTarget.z/dist };
-                bool blocked = Physics_Raycast(eye, rayDir, dist * 0.92f, ~0, NULL) != 0;
-                if (blocked) { blockedCount++; continue; }
+            if (!bone_is_visible(eye, aimPoint)) {
+                // Selected bone (e.g. head) is behind cover this instant.
+                // Instead of rejecting the whole target, scan a handful of
+                // other bones (multipoint) — if the enemy has ANY part
+                // exposed (an arm/shoulder poking around a corner, etc.),
+                // aim there instead of at the hidden bone. Only reject if
+                // every probed point is also blocked.
+                bool anyVisible = false;
+                for (int bi = 0; bi < kAimProbeCount; bi++) {
+                    Vector3 p;
+                    if (!get_bone_pos(obj, kAimProbeBones[bi], p)) continue;
+                    if (bone_is_visible(eye, p)) { finalAimPoint = p; anyVisible = true; usedProbe = true; break; }
+                }
+                if (!anyVisible) { blockedCount++; continue; }
             }
         }
+        if (usedProbe) probeUsed++;
 
-        bestDist2 = d2; best = obj; bestAimPoint = aimPoint; bestUsedBone = usedBone;
+        bestDist2 = d2; best = obj; bestAimPoint = finalAimPoint; bestUsedBone = usedBone;
     }
     g_raycast_targets_blocked = blockedCount;
     g_aimbot_bone_hits = boneHits; g_aimbot_bone_misses = boneMisses; g_aimbot_candidates = candidates;
-    if (!best) return;
+    g_aimbot_probe_used = probeUsed;
+    if (!best) { g_aim_state_valid = false; return; }
     g_aimbot_used_bone = bestUsedBone;
     g_aimbot_last_eye = eye;
     g_aimbot_last_aimpoint = bestAimPoint;
@@ -1037,7 +1097,7 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     // convention the atan2/asin below are built around).
     Vector3 d{ eye.x - bestAimPoint.x, eye.y - bestAimPoint.y, eye.z - bestAimPoint.z };
     float mag = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
-    if (mag < 0.001f) return;
+    if (mag < 0.001f) { g_aim_state_valid = false; return; }
     const float r2d = 180.0f / (float)M_PI;
     float pitch = asinf(d.y / mag) * r2d;
     float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
@@ -1053,13 +1113,20 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     Quat targetQ = euler_to_quat_unity(pitch, yaw, 0.0f);
     Quat* cur = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
     float t = g_aimbot_smooth; if (t < 0.02f) t = 0.02f; if (t > 1.0f) t = 1.0f;
-    // True slerp (quat_slerp handles the double-cover shortest-path flip
-    // internally) instead of plain lerp+normalize — nlerp's angular speed
-    // isn't constant across the arc, so a fresh target 90+ degrees off still
-    // eased unevenly and could visibly overshoot past the bone mid-turn even
-    // with the hemisphere fix. Slerp panning speed is uniform regardless of
-    // start angle.
-    Quat blended = quat_slerp(*cur, targetQ, t);
+    // Blend from OUR OWN last output, not from *cur. *cur turned out to
+    // reflect the game's real (untouched) view each tick rather than what we
+    // wrote last frame, so blending from it recomputed the identical step
+    // from the identical baseline to the identical target every single tick
+    // — the camera turned partway toward a stationary enemy and then just
+    // froze there instead of continuing to close the gap. Seed our state
+    // from the real value only once, on acquisition, then every subsequent
+    // tick genuinely advances further from where we left off. True slerp
+    // (quat_slerp handles the double-cover shortest-path flip internally)
+    // instead of plain lerp+normalize, since nlerp's angular speed isn't
+    // constant across the arc.
+    if (!g_aim_state_valid) { g_aim_state_quat = *cur; g_aim_state_valid = true; }
+    Quat blended = quat_slerp(g_aim_state_quat, targetQ, t);
+    g_aim_state_quat = blended;
     *cur = blended;
 
     // m_qCameraRotation alone didn't visibly turn the camera — it likely only
@@ -1362,8 +1429,8 @@ static void render_frame(float screenW, float screenH) {
         char buf[128];
         snprintf(buf, sizeof(buf), "aimbot hook calls=%ld  thiz=%p", g_hook_call_count, g_hook_last_thiz);
         draw_outlined_text(dl, ImVec2(10, 34), IM_COL32(255,220,80,255), buf);
-        snprintf(buf, sizeof(buf), "raycast floor_test=%d (1=working)  blocked_last_tick=%d",
-                 g_raycast_floor_test, g_raycast_targets_blocked);
+        snprintf(buf, sizeof(buf), "raycast floor_test=%d (1=working)  blocked_last_tick=%d  probe_used=%d",
+                 g_raycast_floor_test, g_raycast_targets_blocked, g_aimbot_probe_used);
         draw_outlined_text(dl, ImVec2(10, 58), IM_COL32(255,180,80,255), buf);
         snprintf(buf, sizeof(buf), "aim candidates=%d boneHit=%d boneMiss=%d usedBone(final)=%d pitch=%.1f yaw=%.1f",
                  g_aimbot_candidates, g_aimbot_bone_hits, g_aimbot_bone_misses, g_aimbot_used_bone,

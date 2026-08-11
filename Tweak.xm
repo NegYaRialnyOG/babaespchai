@@ -912,12 +912,6 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     std::vector<void*> players;
     enum_plh_players(players);
 
-    // Real eye position: the LOCAL player's own head bone, not a guessed
-    // world-unit offset from the controller's transform. Aiming too high was
-    // exactly this — the controller anchor sits at the KCC capsule's own
-    // reference point (not eye height), so a flat "+1.5" fudge overshot.
-    // Fall back to the old controller-transform+offset only if the local
-    // player's bones aren't available for some reason.
     void* localPd = NULL;
     int autoLocalTeam = -1;
     for (void* obj : players) {
@@ -925,8 +919,18 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     }
     const int effectiveLocalTeam = (g_local_team >= 0) ? g_local_team : autoLocalTeam;
 
+    // Real eye position: the CAMERA's own transform, not a bone. Diagnostics
+    // showed the local player's own head bone (PlayerObject.trhb) returns
+    // near-(0,0,0) garbage — first-person games don't animate/position your
+    // OWN body skeleton since you never see it, only remote players' bones
+    // are actually driven (confirmed: boneHit=4 boneMiss=0 for enemies, but
+    // the local head-bone lookup was silently "succeeding" with a stale/
+    // unpositioned template transform). The render camera's position IS
+    // where the game is rendering from, by definition — no guessing needed.
+    void* camTf = Comp_get_tf(cam, NULL);
     Vector3 eye;
-    bool haveRealEye = localPd && get_bone_pos(localPd, BONE_HEAD, eye);
+    bool haveRealEye = safe_ptr(camTf);
+    if (haveRealEye) eye = Tf_get_pos(camTf, NULL);
     if (!haveRealEye) {
         void* ctrlTf = Comp_get_tf(controller, NULL);
         if (!safe_ptr(ctrlTf)) return;

@@ -10,7 +10,6 @@
 #import <UIKit/UIKit.h>
 #import <MetalKit/MetalKit.h>
 #import <Metal/Metal.h>
-#include <IOKit/IOKitLib.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <string.h>

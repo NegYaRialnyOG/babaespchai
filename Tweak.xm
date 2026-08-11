@@ -213,18 +213,9 @@ static void*     g_ecc_type_obj  = NULL;   // cached System.Type for the above
 static bool      g_aimbot_on         = false;
 static float     g_aimbot_fov_px     = 220.0f;  // max screen-space distance (UI points) from crosshair to consider a target
 static float     g_aimbot_smooth     = 0.25f;   // 0..1 lerp factor per tick toward the target direction (lower = smoother/slower)
-static float     g_aimbot_eye_off    = 1.5f;    // world units up from controller anchor to eye height
 static int       g_aimbot_bone       = BONE_CHEST; // which bone to aim at, when bones are available
 static bool      g_aimbot_wallcheck  = true;   // skip targets with no clear line of sight (Physics.Raycast)
-static int       g_raycast_floor_test = -1;    // -1=not run, 0=no hit, 1=hit — sanity check the Raycast binding itself
-static int       g_raycast_targets_blocked = 0; // how many candidates the wallcheck rejected, last tick
-static int       g_aimbot_bone_hits   = 0;   // last-tick: candidates where get_bone_pos succeeded
-static int       g_aimbot_bone_misses = 0;   // last-tick: candidates that fell back to the flat Pos field
-static bool      g_aimbot_used_bone   = false; // did the FINAL picked target use a real bone, or fallback Pos
-static float     g_aimbot_last_pitch  = 0, g_aimbot_last_yaw = 0;
-static Vector3   g_aimbot_last_eye{}, g_aimbot_last_aimpoint{};
-static int       g_aimbot_candidates  = 0;   // how many passed health/team/FOV before wallcheck
-static int       g_aimbot_probe_used  = 0;   // last-tick: final target was re-aimed to a multipoint fallback bone (selected bone was blocked, another wasn't)
+static bool      g_silent_on         = false;  // silent aim: spoof server-side rotation via Client::send_pos, screen never turns
 // Persistent aim-turn state, updated ourselves frame-to-frame instead of
 // re-reading the inputs struct's "cur" field as the slerp start point. The
 // struct's field turned out to reflect the game's own (untouched, since the
@@ -528,15 +519,6 @@ static bool find_visible_point_near(Vector3 eye, Vector3 center, float radius, V
     return false;
 }
 
-// Multipoint visibility fallback set: if the SELECTED aim bone is blocked,
-// try these before giving up on the target entirely — mirrors how a human
-// would still shoot whatever part of the enemy is actually poking out from
-// behind cover instead of freezing because the one bone we insisted on
-// (usually the head) happens to be the part that's hidden this instant.
-static const int kAimProbeBones[] = { BONE_HEAD, BONE_CHEST, BONE_LOWERCHEST, BONE_STOMACH,
-                                       BONE_R_UPARM, BONE_L_UPARM, BONE_R_HAND, BONE_L_HAND };
-static const int kAimProbeCount = (int)(sizeof(kAimProbeBones) / sizeof(kAimProbeBones[0]));
-
 // Resolve exactly like the Android source: NO il2cpp_domain_get (that hung),
 // NO thread_attach. Then AUTO-PICK whichever candidate PLH field actually
 // holds sane player data — no manual retyping needed when the game updates
@@ -544,9 +526,11 @@ static const int kAimProbeCount = (int)(sizeof(kAimProbeBones) / sizeof(kAimProb
 // name in the menu if every candidate scores 0 (rare: a brand new field
 // layout, not just a renamed one).
 static void install_aimbot_hook();  // defined below; forward-declared for use here
+static void install_silent_hook();  // defined below; forward-declared for use here
 static void resolve_all() {
     write_step(10); bind_pointers();
     install_aimbot_hook();
+    install_silent_hook();
     write_step(11); g_asmb = il2cpp_domain_assembly_open ? il2cpp_domain_assembly_open(NULL, g_asm_name) : NULL;
     write_step(12); g_img  = (g_asmb && il2cpp_assembly_get_image) ? il2cpp_assembly_get_image(g_asmb) : NULL;
     write_step(13); g_plh_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", g_plh_cls) : NULL;
@@ -1022,20 +1006,32 @@ static Quat quat_slerp(Quat a, Quat b, float t) {
     return r;
 }
 
-static void apply_aimbot(void* controller, void* inputsPtr) {
-    if (!g_aimbot_on || !g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) { g_aim_state_valid = false; return; }
-    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; return; }
+// Shared target-finding logic: enumerate PLH players, pick the closest one
+// to the crosshair within FOV that's actually visible (edge-sampled around
+// the selected bone), and hand back where to look and from where. Used by
+// BOTH aim mechanisms below — the visual aimbot (turns the camera) and the
+// silent aim (only spoofs the server, screen never moves) — so target
+// selection and visibility logic stay identical between the two regardless
+// of which one is doing the actual aiming.
+static bool find_aim_target(void*& outCam, Vector3& outEye, Vector3& outAimPoint) {
+    if (!g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) return false;
 
     void* cam = Camera_get_main(NULL);
-    if (!cam) { g_aim_state_valid = false; return; }
+    if (!cam) return false;
 
     float gameW = Camera_get_pixelWidth  ? (float)Camera_get_pixelWidth(cam, NULL)  : g_scrW;
     float gameH = Camera_get_pixelHeight ? (float)Camera_get_pixelHeight(cam, NULL) : g_scrH;
     if (gameW <= 0) gameW = g_scrW;
     if (gameH <= 0) gameH = g_scrH;
-    if (g_scrW <= 0 || g_scrH <= 0 || gameW <= 0 || gameH <= 0) { g_aim_state_valid = false; return; }
+    if (g_scrW <= 0 || g_scrH <= 0 || gameW <= 0 || gameH <= 0) return false;
     const float sx = g_scrW / gameW, sy = g_scrH / gameH;
     const float cxScreen = g_scrW * 0.5f, cyScreen = g_scrH * 0.5f;
+
+    // Eye = the render camera's own transform position — the game's actual
+    // view origin, no guessing needed.
+    void* camTf = Comp_get_tf(cam, NULL);
+    if (!safe_ptr(camTf)) return false;
+    Vector3 eye = Tf_get_pos(camTf, NULL);
 
     std::vector<void*> players;
     enum_plh_players(players);
@@ -1046,38 +1042,7 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     }
     const int effectiveLocalTeam = (g_local_team >= 0) ? g_local_team : autoLocalTeam;
 
-    // Real eye position: the CAMERA's own transform, not a bone. Diagnostics
-    // showed the local player's own head bone (PlayerObject.trhb) returns
-    // near-(0,0,0) garbage — first-person games don't animate/position your
-    // OWN body skeleton since you never see it, only remote players' bones
-    // are actually driven (confirmed: boneHit=4 boneMiss=0 for enemies, but
-    // the local head-bone lookup was silently "succeeding" with a stale/
-    // unpositioned template transform). The render camera's position IS
-    // where the game is rendering from, by definition — no guessing needed.
-    void* camTf = Comp_get_tf(cam, NULL);
-    Vector3 eye;
-    bool haveRealEye = safe_ptr(camTf);
-    if (haveRealEye) eye = Tf_get_pos(camTf, NULL);
-    if (!haveRealEye) {
-        void* ctrlTf = Comp_get_tf(controller, NULL);
-        if (!safe_ptr(ctrlTf)) { g_aim_state_valid = false; return; }
-        eye = Tf_get_pos(ctrlTf, NULL);
-        eye.y += g_aimbot_eye_off;
-    }
-
-    // Self-test: raycast straight down 50 units. The floor is almost always
-    // there, so this answers "does the Physics.Raycast binding even work at
-    // all" independent of any doubt about wall geometry specifically.
-    if (Physics_Raycast) {
-        Vector3 down{0.0f, -1.0f, 0.0f};
-        g_raycast_floor_test = (Physics_Raycast(eye, down, 50.0f, ~0, NULL) != 0) ? 1 : 0;
-    } else {
-        g_raycast_floor_test = -1;
-    }
-    int blockedCount = 0;
-    int boneHits = 0, boneMisses = 0, candidates = 0, probeUsed = 0;
-
-    void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{}; bool bestUsedBone = false;
+    void* best = NULL; float bestDist2 = 1e18f; Vector3 bestAimPoint{};
     for (void* obj : players) {
         if (*(bool*)((char*)obj + g_pd_local)) continue;
         int hp = *(int*)((char*)obj + g_pd_health);
@@ -1087,71 +1052,52 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
             if (tm == effectiveLocalTeam) continue;
         }
         Vector3 aimPoint, bonePos;
-        bool usedBone = get_bone_pos(obj, g_aimbot_bone, bonePos);
-        if (usedBone) { aimPoint = bonePos; boneHits++; }
-        else { aimPoint = *(Vector3*)((char*)obj + g_pd_pos); boneMisses++; }
+        aimPoint = get_bone_pos(obj, g_aimbot_bone, bonePos) ? bonePos : *(Vector3*)((char*)obj + g_pd_pos);
 
-        // FOV/priority screening always uses the SELECTED bone's screen
-        // position (crosshair distance) — multipoint only kicks in below,
-        // for the visibility test, so switching which bone is exposed never
-        // changes which enemy gets picked, only whether the pick is honored.
         Vector3 s = W2S(cam, aimPoint, NULL);
         if (s.z <= 0.0f) continue;
         float ux = s.x * sx, uy = g_scrH - (s.y * sy);
         float dx = ux - cxScreen, dy = uy - cyScreen;
         float d2 = dx*dx + dy*dy;
         if (d2 > g_aimbot_fov_px * g_aimbot_fov_px) continue;
-        candidates++;
         if (d2 >= bestDist2) continue;
 
         Vector3 finalAimPoint = aimPoint;
-        bool usedProbe = false;
         if (g_aimbot_wallcheck && Physics_Raycast) {
+            // Aim at whatever visible edge of the SELECTED bone is exposed
+            // (dead-center if clear, otherwise a sliver around it) — reject
+            // the target only if no part of that bone is visible at all.
             Vector3 edgePoint;
-            if (find_visible_point_near(eye, aimPoint, kBoneVisRadius, edgePoint)) {
-                // Either dead-center was already visible, or an edge of the
-                // SAME selected bone was (e.g. the side of the head peeking
-                // past a corner) — aim at that exact visible sliver instead
-                // of insisting on the occluded center.
-                finalAimPoint = edgePoint;
-            } else {
-                // Not even the edges of the selected bone are exposed.
-                // Instead of rejecting the whole target, scan a handful of
-                // OTHER bones (multipoint) — if the enemy has ANY part
-                // exposed (an arm/shoulder poking around a corner, etc.),
-                // aim there instead of at the hidden bone. Only reject if
-                // every probed point is also blocked.
-                bool anyVisible = false;
-                for (int bi = 0; bi < kAimProbeCount; bi++) {
-                    Vector3 p;
-                    if (!get_bone_pos(obj, kAimProbeBones[bi], p)) continue;
-                    if (bone_is_visible(eye, p)) { finalAimPoint = p; anyVisible = true; usedProbe = true; break; }
-                }
-                if (!anyVisible) { blockedCount++; continue; }
-            }
+            if (!find_visible_point_near(eye, aimPoint, kBoneVisRadius, edgePoint)) continue;
+            finalAimPoint = edgePoint;
         }
-        if (usedProbe) probeUsed++;
 
-        bestDist2 = d2; best = obj; bestAimPoint = finalAimPoint; bestUsedBone = usedBone;
+        bestDist2 = d2; best = obj; bestAimPoint = finalAimPoint;
     }
-    g_raycast_targets_blocked = blockedCount;
-    g_aimbot_bone_hits = boneHits; g_aimbot_bone_misses = boneMisses; g_aimbot_candidates = candidates;
-    g_aimbot_probe_used = probeUsed;
-    if (!best) { g_aim_state_valid = false; return; }
-    g_aimbot_used_bone = bestUsedBone;
-    g_aimbot_last_eye = eye;
-    g_aimbot_last_aimpoint = bestAimPoint;
+    if (!best) return false;
+
+    outCam = cam;
+    outEye = eye;
+    outAimPoint = bestAimPoint;
+    return true;
+}
+
+static void apply_aimbot(void* controller, void* inputsPtr) {
+    if (!g_aimbot_on) { g_aim_state_valid = false; return; }
+    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; return; }
+
+    void* cam; Vector3 eye, aimPoint;
+    if (!find_aim_target(cam, eye, aimPoint)) { g_aim_state_valid = false; return; }
 
     // Pitch/yaw from eye->target, exactly matching the reference's calcAngle
     // (note: delta is eye-minus-target, not target-minus-eye — the sign
     // convention the atan2/asin below are built around).
-    Vector3 d{ eye.x - bestAimPoint.x, eye.y - bestAimPoint.y, eye.z - bestAimPoint.z };
+    Vector3 d{ eye.x - aimPoint.x, eye.y - aimPoint.y, eye.z - aimPoint.z };
     float mag = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
     if (mag < 0.001f) { g_aim_state_valid = false; return; }
     const float r2d = 180.0f / (float)M_PI;
     float pitch = asinf(d.y / mag) * r2d;
     float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
-    g_aimbot_last_pitch = pitch; g_aimbot_last_yaw = yaw;
 
     // The field that steers the camera is a quaternion (m_qCameraRotation)
     // INSIDE the inputs struct passed to SetInputs, at offset 0x8 in OUR
@@ -1196,23 +1142,18 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
 }
 
 // ---------------------------------------------------------------------------
-// SetInputs hook. Unambiguous target (unlike send_pos's 5 signature-identical
-// candidates): this exact overload keeps its real name AND matches the
-// source's own hook point, because it's a public contract method of the
-// open-source KinematicCharacterController asset that couldn't be safely
-// renamed. We DO now write into the `inputs` struct — specifically only the
-// m_qCameraRotation quaternion at the confirmed offset 0x18 — before
+// SetInputs hook (visual aim). Keeps its real name because it's a public
+// contract method of the open-source KinematicCharacterController asset
+// that couldn't be safely renamed by whatever obfuscated the rest of the
+// assembly. We write into the `inputs` struct's m_qCameraRotation quaternion
+// at offset 0x8 (verified against our own dump's struct layout) before
 // forwarding to the original, which is what actually applies our aim.
 #define RVA_ECC_SETINPUTS 0x2d8f68c
 typedef void (*ECC_SetInputs_t)(void*, void*, void*);
 static ECC_SetInputs_t Orig_ECC_SetInputs = NULL;
 static bool g_aimbot_hook_installed = false;
-static long g_hook_call_count = 0;     // proves whether the hook fires AT ALL during live play
-static void* g_hook_last_thiz = NULL;  // which controller instance is actually calling us
 
 static void Hook_ECC_SetInputs(void* thiz, void* inputs, void* method) {
-    g_hook_call_count++;
-    g_hook_last_thiz = thiz;
     // Modify BEFORE forwarding — the original SetInputs is what actually
     // consumes m_qCameraRotation for this frame, so our value must already
     // be in place when it runs, not written after the fact.
@@ -1225,6 +1166,58 @@ static void install_aimbot_hook() {
     void* target = (void*)(g_image_base + RVA_ECC_SETINPUTS);
     MSHookFunction(target, (void*)Hook_ECC_SetInputs, (void**)&Orig_ECC_SetInputs);
     g_aimbot_hook_installed = true;
+}
+
+// ---------------------------------------------------------------------------
+// Silent aim: Client::send_pos hook. This is the actual per-tick network
+// position/rotation report — same function the reference cheat's own source
+// hooks (Hooks::New_Client$$send_pos in hooks.cpp, "LMJBEIGNJIK" in their
+// build). Their build's obfuscated name is useless to us (obfuscation is
+// randomized per compile), but the C# CLASS name "Client" isn't obfuscated,
+// and the reference's own confirmed signature — 5 floats + 1 byte — turned
+// out to be UNIQUE across every method in our own dump's Client class (only
+// one match: MDPEDGFFIFI @ RVA 0x34BFF90). That's what actually disambiguates
+// it — earlier in this project there were multiple same-shaped candidates
+// around this class and no safe way to pick blind; the reference gave us the
+// real parameter count/types to match structurally instead of guessing.
+//
+// Overriding the rotation args here and letting the ORIGINAL still run makes
+// the SERVER believe we're looking at the target — hit registration uses
+// that server-side rotation. Our own camera/Transform is never touched, so
+// nothing on screen turns: that's the entire difference from the visual
+// aimbot above.
+#define RVA_CLIENT_SEND_POS 0x34BFF90
+typedef void (*Client_SendPos_t)(void*, float, float, float, float, float, uint8_t, void*);
+static Client_SendPos_t Orig_Client_SendPos = NULL;
+static bool g_silent_hook_installed = false;
+
+static void Hook_Client_SendPos(void* thiz, float rx, float ry, float rz, float lx, float ly, uint8_t bitmask, void* method) {
+    if (g_silent_on) {
+        void* cam; Vector3 eye, aimPoint;
+        if (find_aim_target(cam, eye, aimPoint)) {
+            Vector3 d{ eye.x - aimPoint.x, eye.y - aimPoint.y, eye.z - aimPoint.z };
+            float mag = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+            if (mag > 0.001f) {
+                const float r2d = 180.0f / (float)M_PI;
+                float pitch = asinf(d.y / mag) * r2d;
+                float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
+                // The reference wraps pitch into 0..360 before sending (see
+                // their send_attackv2 correction path) — the network/server
+                // rotation representation expects that range, not signed
+                // -180..180. Yaw is left as-is, matching the reference.
+                if (pitch < 0.0f) pitch += 360.0f;
+                if (Orig_Client_SendPos) { Orig_Client_SendPos(thiz, rx, ry, rz, pitch, yaw, bitmask, method); return; }
+            }
+        }
+    }
+    if (Orig_Client_SendPos) Orig_Client_SendPos(thiz, rx, ry, rz, lx, ly, bitmask, method);
+}
+
+static void install_silent_hook() {
+    if (g_silent_hook_installed || !g_image_base) return;
+    void* target = (void*)(g_image_base + RVA_CLIENT_SEND_POS);
+    MSHookFunction(target, (void*)Hook_Client_SendPos, (void**)&Orig_Client_SendPos);
+    g_silent_hook_installed = true;
 }
 
 static void main_pump() {
@@ -1304,11 +1297,13 @@ static void render_frame(float screenW, float screenH) {
             ImGui::Checkbox("Armor bar", &g_show_armor_bar); ImGui::SameLine();
             ImGui::Checkbox("Weapon name", &g_show_weapon);
 
-            ImGui::SeparatorText("Aimbot (visual — SetInputs hook)");
-            ImGui::Checkbox("Aimbot", &g_aimbot_on);
-            ImGui::SameLine(); ImGui::TextDisabled("(hooks SetInputs, writes lookInputVector every frame)");
+            ImGui::SeparatorText("Aimbot");
+            ImGui::Checkbox("Aimbot (visual)", &g_aimbot_on);
+            ImGui::SameLine(); ImGui::TextDisabled("(turns the camera)");
+            ImGui::Checkbox("Silent aim", &g_silent_on);
+            ImGui::SameLine(); ImGui::TextDisabled("(server-side only, screen never turns)");
             ImGui::SliderFloat("FOV (px)", &g_aimbot_fov_px, 20.0f, 600.0f);
-            ImGui::SliderFloat("Smoothness", &g_aimbot_smooth, 0.02f, 1.0f);
+            ImGui::SliderFloat("Smoothness (visual)", &g_aimbot_smooth, 0.02f, 1.0f);
             ImGui::SameLine(); ImGui::TextDisabled("(low=slow/smooth, 1=instant snap)");
             static const char* boneNames[] = {"stomach","lowerChest","chest","head"};
             static int boneSel = 2; // chest default
@@ -1470,27 +1465,6 @@ static void render_frame(float screenW, float screenH) {
         }
     }
 
-    // Aimbot hook call counter — NOT time-limited (unlike the load banner
-    // above) since RESOLVE and aim-testing can happen well after 20s, and
-    // this is the one fact that actually answers "does SetInputs even fire
-    // during live play" without opening the menu or pasting any logs.
-    if (g_aimbot_hook_installed) {
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        char buf[128];
-        snprintf(buf, sizeof(buf), "aimbot hook calls=%ld  thiz=%p", g_hook_call_count, g_hook_last_thiz);
-        draw_outlined_text(dl, ImVec2(10, 34), IM_COL32(255,220,80,255), buf);
-        snprintf(buf, sizeof(buf), "raycast floor_test=%d (1=working)  blocked_last_tick=%d  probe_used=%d",
-                 g_raycast_floor_test, g_raycast_targets_blocked, g_aimbot_probe_used);
-        draw_outlined_text(dl, ImVec2(10, 58), IM_COL32(255,180,80,255), buf);
-        snprintf(buf, sizeof(buf), "aim candidates=%d boneHit=%d boneMiss=%d usedBone(final)=%d pitch=%.1f yaw=%.1f",
-                 g_aimbot_candidates, g_aimbot_bone_hits, g_aimbot_bone_misses, g_aimbot_used_bone,
-                 g_aimbot_last_pitch, g_aimbot_last_yaw);
-        draw_outlined_text(dl, ImVec2(10, 82), IM_COL32(180,220,255,255), buf);
-        snprintf(buf, sizeof(buf), "eye=(%.1f,%.1f,%.1f) aimpoint=(%.1f,%.1f,%.1f)",
-                 g_aimbot_last_eye.x, g_aimbot_last_eye.y, g_aimbot_last_eye.z,
-                 g_aimbot_last_aimpoint.x, g_aimbot_last_aimpoint.y, g_aimbot_last_aimpoint.z);
-        draw_outlined_text(dl, ImVec2(10, 106), IM_COL32(180,220,255,255), buf);
-    }
 
     { std::lock_guard<std::mutex> l(g_rects_mtx); g_capture_rects = rects; }
 }

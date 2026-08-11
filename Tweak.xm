@@ -898,6 +898,40 @@ static Quat euler_to_quat_unity(float pitchDeg, float yawDeg, float rollDeg) {
     return q;
 }
 
+// Proper spherical interpolation (Shoemake). NLERP (plain lerp+normalize)
+// only approximates constant angular velocity and gets visibly uneven
+// (eases oddly, "sticks" near the ends) once the angle between a and b is
+// more than a few degrees — exactly the case here since a fresh target can
+// be 90+ degrees from the current view. Slerp walks the shortest arc at a
+// constant rate instead, so panning speed feels the same regardless of how
+// far off-target the camera currently is.
+static Quat quat_slerp(Quat a, Quat b, float t) {
+    float dot = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+    if (dot < 0.0f) { b.x = -b.x; b.y = -b.y; b.z = -b.z; b.w = -b.w; dot = -dot; }
+    Quat r;
+    if (dot > 0.9995f) {
+        // Nearly identical: sin(theta0) below would be ~0 (divide-by-zero
+        // risk), and linear blending is visually indistinguishable here anyway.
+        r.x = a.x + (b.x - a.x) * t;
+        r.y = a.y + (b.y - a.y) * t;
+        r.z = a.z + (b.z - a.z) * t;
+        r.w = a.w + (b.w - a.w) * t;
+    } else {
+        float theta0 = acosf(dot);
+        float theta  = theta0 * t;
+        float sinTheta0 = sinf(theta0);
+        float s0 = cosf(theta) - dot * (sinf(theta) / sinTheta0);
+        float s1 = sinf(theta) / sinTheta0;
+        r.x = s0*a.x + s1*b.x;
+        r.y = s0*a.y + s1*b.y;
+        r.z = s0*a.z + s1*b.z;
+        r.w = s0*a.w + s1*b.w;
+    }
+    float n = sqrtf(r.x*r.x + r.y*r.y + r.z*r.z + r.w*r.w);
+    if (n > 0.0001f) { r.x/=n; r.y/=n; r.z/=n; r.w/=n; }
+    return r;
+}
+
 static void apply_aimbot(void* controller, void* inputsPtr) {
     if (!g_aimbot_on || !g_resolved || !W2S || !Camera_get_main || !Tf_get_pos || !Comp_get_tf) return;
     if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) return;
@@ -1019,26 +1053,13 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     Quat targetQ = euler_to_quat_unity(pitch, yaw, 0.0f);
     Quat* cur = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
     float t = g_aimbot_smooth; if (t < 0.02f) t = 0.02f; if (t > 1.0f) t = 1.0f;
-    // Quaternions have double cover (q and -q are the same rotation). Naive
-    // component-wise lerp doesn't know that, so if cur and targetQ happen to
-    // land on opposite hemispheres (dot<0) it blends along the LONG way
-    // around instead of the short way — the interpolated path swings off
-    // through unrelated orientations before settling, which looked like
-    // "follows but aims at the wrong bone/offset" whenever t<1 gave it more
-    // than one frame to converge. At t=1 this never showed up because
-    // blended reduces to targetQ exactly regardless of hemisphere. Fix:
-    // flip targetQ's sign first so both quats are in the same hemisphere,
-    // then lerp+normalize (standard NLERP).
-    if ((cur->x*targetQ.x + cur->y*targetQ.y + cur->z*targetQ.z + cur->w*targetQ.w) < 0.0f) {
-        targetQ.x = -targetQ.x; targetQ.y = -targetQ.y; targetQ.z = -targetQ.z; targetQ.w = -targetQ.w;
-    }
-    Quat blended;
-    blended.x = cur->x + (targetQ.x - cur->x) * t;
-    blended.y = cur->y + (targetQ.y - cur->y) * t;
-    blended.z = cur->z + (targetQ.z - cur->z) * t;
-    blended.w = cur->w + (targetQ.w - cur->w) * t;
-    float n = sqrtf(blended.x*blended.x + blended.y*blended.y + blended.z*blended.z + blended.w*blended.w);
-    if (n > 0.0001f) { blended.x/=n; blended.y/=n; blended.z/=n; blended.w/=n; }
+    // True slerp (quat_slerp handles the double-cover shortest-path flip
+    // internally) instead of plain lerp+normalize — nlerp's angular speed
+    // isn't constant across the arc, so a fresh target 90+ degrees off still
+    // eased unevenly and could visibly overshoot past the bone mid-turn even
+    // with the hemisphere fix. Slerp panning speed is uniform regardless of
+    // start angle.
+    Quat blended = quat_slerp(*cur, targetQ, t);
     *cur = blended;
 
     // m_qCameraRotation alone didn't visibly turn the camera — it likely only

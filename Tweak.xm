@@ -1019,6 +1019,19 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     Quat targetQ = euler_to_quat_unity(pitch, yaw, 0.0f);
     Quat* cur = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
     float t = g_aimbot_smooth; if (t < 0.02f) t = 0.02f; if (t > 1.0f) t = 1.0f;
+    // Quaternions have double cover (q and -q are the same rotation). Naive
+    // component-wise lerp doesn't know that, so if cur and targetQ happen to
+    // land on opposite hemispheres (dot<0) it blends along the LONG way
+    // around instead of the short way — the interpolated path swings off
+    // through unrelated orientations before settling, which looked like
+    // "follows but aims at the wrong bone/offset" whenever t<1 gave it more
+    // than one frame to converge. At t=1 this never showed up because
+    // blended reduces to targetQ exactly regardless of hemisphere. Fix:
+    // flip targetQ's sign first so both quats are in the same hemisphere,
+    // then lerp+normalize (standard NLERP).
+    if ((cur->x*targetQ.x + cur->y*targetQ.y + cur->z*targetQ.z + cur->w*targetQ.w) < 0.0f) {
+        targetQ.x = -targetQ.x; targetQ.y = -targetQ.y; targetQ.z = -targetQ.z; targetQ.w = -targetQ.w;
+    }
     Quat blended;
     blended.x = cur->x + (targetQ.x - cur->x) * t;
     blended.y = cur->y + (targetQ.y - cur->y) * t;

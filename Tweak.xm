@@ -30,6 +30,7 @@ static double g_overlay_start_time = 0;
 static bool   g_gesture_host_found = false;
 
 struct Vector3 { float x, y, z; };
+struct Quat { float x, y, z, w; };   // Unity Quaternion layout
 
 // Resolved Unity methods (called by address; trailing arg = hidden MethodInfo*)
 typedef Vector3 (*Cam_W2S_t)(void* camera, Vector3 pos, void* method);      // Camera.WorldToScreenPoint(Vector3)
@@ -39,12 +40,14 @@ typedef void*   (*FindObjs_t)(void* type, void* method);                    // O
 typedef void*   (*Comp_get_tf_t)(void* component, void* method);           // Component.get_transform
 typedef int32_t (*Cam_pixelDim_t)(void* camera, void* method);             // Camera.get_pixelWidth/Height
 typedef uint8_t (*Physics_Raycast_t)(Vector3 origin, Vector3 direction, float maxDistance, int32_t layerMask, void* method); // Physics.Raycast(...) -> bool (il2cpp bool = 1 byte)
+typedef void    (*Tf_set_rot_t)(void* transform, Quat value, void* method);  // Transform.set_rotation(Quaternion)
 
 static Cam_W2S_t      W2S             = NULL;
 static Cam_get_main_t Camera_get_main = NULL;
 static Tf_get_pos_t   Tf_get_pos      = NULL;
 static FindObjs_t     FindObjs        = NULL;
 static Physics_Raycast_t Physics_Raycast = NULL;
+static Tf_set_rot_t   Tf_set_rotation  = NULL;
 static Comp_get_tf_t  Comp_get_tf     = NULL;
 static Cam_pixelDim_t Camera_get_pixelWidth  = NULL;
 static Cam_pixelDim_t Camera_get_pixelHeight = NULL;
@@ -89,6 +92,7 @@ static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value    = NUL
 #define RVA_GET_PIXEL_WIDTH  0x47b1658   // Camera.get_pixelWidth -> int
 #define RVA_GET_PIXEL_HEIGHT 0x47b1698   // Camera.get_pixelHeight -> int
 #define RVA_PHYSICS_RAYCAST  0x483dac4   // Physics.Raycast(Vector3,Vector3,float,int) -> bool
+#define RVA_TF_SET_ROTATION  0x47f3bec   // Transform.set_rotation(Quaternion)
 
 #define RVA_il2cpp_domain_get            0x25797f0
 #define RVA_il2cpp_domain_assembly_open  0x25797f4
@@ -345,6 +349,7 @@ static void bind_pointers() {
     Camera_get_pixelWidth  = (Cam_pixelDim_t)(B + RVA_GET_PIXEL_WIDTH);
     Camera_get_pixelHeight = (Cam_pixelDim_t)(B + RVA_GET_PIXEL_HEIGHT);
     Physics_Raycast = (Physics_Raycast_t)(B + RVA_PHYSICS_RAYCAST);
+    Tf_set_rotation = (Tf_set_rot_t)(B + RVA_TF_SET_ROTATION);
 
     il2cpp_domain_get           = (il2cpp_domain_get_t)          (B + RVA_il2cpp_domain_get);
     il2cpp_domain_assembly_open = (il2cpp_domain_assembly_open_t)(B + RVA_il2cpp_domain_assembly_open);
@@ -877,7 +882,6 @@ static void compute_boxes() {
 // "controller consumes lookInputVector for rotation" — every single frame.
 // Quaternion layout matches Unity's own (x,y,z,w), 16 bytes — standard, not
 // build-specific.
-struct Quat { float x, y, z, w; };
 
 // Unity's exact Quaternion.Euler formula (pitch=x, yaw=y, roll=z, degrees),
 // lifted directly from a working reference implementation for this game.
@@ -1023,6 +1027,21 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     float n = sqrtf(blended.x*blended.x + blended.y*blended.y + blended.z*blended.z + blended.w*blended.w);
     if (n > 0.0001f) { blended.x/=n; blended.y/=n; blended.z/=n; blended.w/=n; }
     *cur = blended;
+
+    // m_qCameraRotation alone didn't visibly turn the camera — it likely only
+    // feeds movement-relative-to-look math (what the antiaim code in the
+    // reference used it for: deliberately diverging from the real view is
+    // the whole point of anti-aim, which only makes sense if this field
+    // ISN'T what renders). So also set the camera's own Transform rotation
+    // directly — Unity renders exactly what a Camera's Transform says,
+    // full stop, no indirection possible. Done here (inside the SetInputs
+    // hook) since that's already proven to run every frame reliably; if the
+    // camera's own look-update runs later in the frame and stomps this, the
+    // effect will be inconsistent and we'll know to hook that instead.
+    if (Tf_set_rotation) {
+        void* camTfForSet = Comp_get_tf(cam, NULL);
+        if (safe_ptr(camTfForSet)) Tf_set_rotation(camTfForSet, blended, NULL);
+    }
 }
 
 // ---------------------------------------------------------------------------

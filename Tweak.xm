@@ -485,6 +485,49 @@ static bool bone_is_visible(Vector3 eye, Vector3 point) {
     return Physics_Raycast(eye, rayDir, castDist, ~0, NULL) == 0;
 }
 
+// A bone position is a single point at the CENTER of e.g. the head — but the
+// head has actual volume, and it's extremely common to see only an EDGE of
+// it (peeking around a corner, over a crate, etc.) while the center point
+// specifically is still occluded. Checking only the center meant those
+// exactly-visible-at-the-edge cases got rejected as "blocked" even though a
+// human would clearly see (and could shoot) the sliver that's exposed. This
+// samples a small ring of points around the bone, offset along the camera-
+// facing right/up axes (built from eye->bone direction, not the character's
+// own facing, so "left/right/up/down" here means what's actually left/
+// right/up/down from the PLAYER'S viewpoint) rather than only ever testing
+// dead-center. Returns the first visible sample (center first), still
+// anchored to the same bone — this is NOT the separate other-bone fallback
+// below, it's sub-bone precision for the one bone that's actually selected.
+static const float kBoneVisRadius = 0.18f; // approx. half-width of a head-sized hitbox, world units
+static bool find_visible_point_near(Vector3 eye, Vector3 center, float radius, Vector3& outPoint) {
+    if (bone_is_visible(eye, center)) { outPoint = center; return true; }
+    Vector3 look{ center.x - eye.x, center.y - eye.y, center.z - eye.z };
+    float lm = sqrtf(look.x*look.x + look.y*look.y + look.z*look.z);
+    if (lm < 0.001f) return false;
+    look.x /= lm; look.y /= lm; look.z /= lm;
+    Vector3 worldUp{0.0f, 1.0f, 0.0f};
+    Vector3 right{ look.y*worldUp.z - look.z*worldUp.y,
+                   look.z*worldUp.x - look.x*worldUp.z,
+                   look.x*worldUp.y - look.y*worldUp.x };
+    float rl = sqrtf(right.x*right.x + right.y*right.y + right.z*right.z);
+    if (rl < 0.001f) { right = Vector3{1.0f, 0.0f, 0.0f}; } else { right.x/=rl; right.y/=rl; right.z/=rl; }
+    Vector3 up{ right.y*look.z - right.z*look.y,
+                right.z*look.x - right.x*look.z,
+                right.x*look.y - right.y*look.x };
+    static const float offs[8][2] = {
+        { 1.0f, 0.0f}, {-1.0f, 0.0f}, {0.0f, 1.0f}, {0.0f,-1.0f},
+        { 0.7f, 0.7f}, {-0.7f, 0.7f}, {0.7f,-0.7f}, {-0.7f,-0.7f},
+    };
+    for (int i = 0; i < 8; i++) {
+        Vector3 p;
+        p.x = center.x + right.x*offs[i][0]*radius + up.x*offs[i][1]*radius;
+        p.y = center.y + right.y*offs[i][0]*radius + up.y*offs[i][1]*radius;
+        p.z = center.z + right.z*offs[i][0]*radius + up.z*offs[i][1]*radius;
+        if (bone_is_visible(eye, p)) { outPoint = p; return true; }
+    }
+    return false;
+}
+
 // Multipoint visibility fallback set: if the SELECTED aim bone is blocked,
 // try these before giving up on the target entirely — mirrors how a human
 // would still shoot whatever part of the enemy is actually poking out from
@@ -1064,10 +1107,17 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         Vector3 finalAimPoint = aimPoint;
         bool usedProbe = false;
         if (g_aimbot_wallcheck && Physics_Raycast) {
-            if (!bone_is_visible(eye, aimPoint)) {
-                // Selected bone (e.g. head) is behind cover this instant.
+            Vector3 edgePoint;
+            if (find_visible_point_near(eye, aimPoint, kBoneVisRadius, edgePoint)) {
+                // Either dead-center was already visible, or an edge of the
+                // SAME selected bone was (e.g. the side of the head peeking
+                // past a corner) — aim at that exact visible sliver instead
+                // of insisting on the occluded center.
+                finalAimPoint = edgePoint;
+            } else {
+                // Not even the edges of the selected bone are exposed.
                 // Instead of rejecting the whole target, scan a handful of
-                // other bones (multipoint) — if the enemy has ANY part
+                // OTHER bones (multipoint) — if the enemy has ANY part
                 // exposed (an arm/shoulder poking around a corner, etc.),
                 // aim there instead of at the hidden bone. Only reject if
                 // every probed point is also blocked.

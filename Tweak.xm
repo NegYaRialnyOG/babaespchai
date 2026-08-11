@@ -185,14 +185,24 @@ static bool      g_show_weapon     = false;
 
 // --- Aimbot: SetInputs hook, writes the camera-rotation quaternion --------
 // ExampleCharacterController.lookInputVector (0xFC) turned out to be the
-// WRONG field — writing it never got overwritten cleanly enough to steer the
-// camera. The actual field the game reads for aim is a quaternion,
-// m_qCameraRotation, INSIDE the inputs struct passed BY REFERENCE to
-// SetInputs — at offset 0x18 in that struct, confirmed against a working
-// reference implementation for this exact game
-// (PlayerCharacterInputs$$CameraRotation = 0x18). Must be written before
-// forwarding to the original SetInputs so the frame actually consumes it.
-static uintptr_t g_ecc_camrot_off = 0x18;  // PlayerCharacterInputs.m_qCameraRotation (Quaternion) inside the SetInputs arg struct
+// WRONG field — writing it never reliably steered the camera. The actual
+// field is a quaternion, m_qCameraRotation, INSIDE the inputs struct passed
+// BY REFERENCE to SetInputs. A reference implementation for this game (a
+// DIFFERENT, older BPM build) put it at offset 0x18 — but that build's
+// struct layout doesn't match ours: OUR dump's own struct definition
+// (`public struct LOJIJGDIIEB`, the exact type SetInputs takes) shows
+//   0x0  float moveAxisForward
+//   0x4  float moveAxisRight
+//   0x8  Quaternion  <- m_qCameraRotation, HERE, not 0x18
+//   0x18 bool jumpDown
+//   0x19 bool crouchDown
+//   0x1A bool crouchUp
+// Writing 16 bytes at 0x18 (the old, cross-build-borrowed offset) was
+// smashing the jump/crouch bools AND writing 13 bytes past the end of the
+// struct into adjacent heap memory — exactly what caused the random
+// jumping/crouching. Verified directly against OUR OWN dump this time,
+// not borrowed from a different build again.
+static uintptr_t g_ecc_camrot_off = 0x8;  // PlayerCharacterInputs.m_qCameraRotation (Quaternion) inside the SetInputs arg struct — verified against our own dump's struct layout
 static char      g_ecc_ns[64]    = "KinematicCharacterController.Examples";
 static char      g_ecc_cls[64]   = "ExampleCharacterController";
 static void*     g_ecc_type_obj  = NULL;   // cached System.Type for the above

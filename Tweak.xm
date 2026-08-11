@@ -912,10 +912,9 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     std::vector<void*> players;
     enum_plh_players(players);
 
-    void* localPd = NULL;
     int autoLocalTeam = -1;
     for (void* obj : players) {
-        if (*(bool*)((char*)obj + g_pd_local)) { localPd = obj; autoLocalTeam = *(int*)((char*)obj + g_pd_team); break; }
+        if (*(bool*)((char*)obj + g_pd_local)) { autoLocalTeam = *(int*)((char*)obj + g_pd_team); break; }
     }
     const int effectiveLocalTeam = (g_local_team >= 0) ? g_local_team : autoLocalTeam;
 

@@ -227,7 +227,17 @@ static bool      g_aimbot_on         = false;
 // full auto-lock.
 static bool      g_assist_mode       = false;
 static float     g_aimbot_fov_px     = 220.0f;  // max screen-space distance (UI points) from crosshair to consider a target
-static float     g_aimbot_smooth     = 0.25f;   // 0..1 lerp factor per tick toward the target direction (lower = smoother/slower)
+// Constant-angular-speed turn rate, degrees/second, NOT a 0..1 lerp fraction.
+// A fixed-fraction slerp (the old g_aimbot_smooth) takes the SAME percentage
+// of whatever the current gap is every tick — which means a big fresh gap
+// (just-acquired target) moves a big ABSOLUTE angle on the very first frame
+// (the "resкий рывок"/sudden jerk), and a tiny gap (converged onto a now-
+// stationary target) moves an imperceptibly tiny angle forever after,
+// visually reading as "stopped following". A capped max-degrees-per-frame
+// step fixes both: the very first frame is limited exactly the same as every
+// later one (no jerk possible), and it keeps closing the gap at a constant
+// rate all the way to an exact lock instead of decaying asymptotically.
+static float     g_aimbot_turn_speed_dps = 900.0f;
 static bool      g_aimbot_wallcheck  = true;   // skip targets with no clear line of sight (Physics.Raycast)
 static bool      g_multipoint_on     = true;   // sample multiple points around each selected hitbox instead of only its exact center
 static int       g_multipoint_count  = 8;      // ring samples around each hitbox, 3..12
@@ -581,6 +591,44 @@ static bool find_visible_point_near(Vector3 eye, Vector3 center, float radius, V
         if (bone_is_visible(eye, p)) { outPoint = p; return true; }
     }
     return false;
+}
+
+// Same ring geometry as find_visible_point_near above, but instead of
+// stopping at the first VISIBLE sample (what aiming wants), this calls back
+// for every sample point — center first, then the full multipoint ring if
+// enabled — so a caller can test each one against its own condition (here:
+// "is the crosshair on it") rather than just "can I see it". Kept separate
+// from find_visible_point_near rather than refactored into it, so the
+// already-working aim path is untouched.
+template <typename F>
+static void for_each_hitbox_sample_point(Vector3 eye, Vector3 center, float radius, bool multipointOn, F&& fn) {
+    if (fn(center)) return;
+    if (!multipointOn) return;
+    Vector3 look{ center.x - eye.x, center.y - eye.y, center.z - eye.z };
+    float lm = sqrtf(look.x*look.x + look.y*look.y + look.z*look.z);
+    if (lm < 0.001f) return;
+    look.x /= lm; look.y /= lm; look.z /= lm;
+    Vector3 worldUp{0.0f, 1.0f, 0.0f};
+    Vector3 right{ look.y*worldUp.z - look.z*worldUp.y,
+                   look.z*worldUp.x - look.x*worldUp.z,
+                   look.x*worldUp.y - look.y*worldUp.x };
+    float rl = sqrtf(right.x*right.x + right.y*right.y + right.z*right.z);
+    if (rl < 0.001f) { right = Vector3{1.0f, 0.0f, 0.0f}; } else { right.x/=rl; right.y/=rl; right.z/=rl; }
+    Vector3 up{ right.y*look.z - right.z*look.y,
+                right.z*look.x - right.x*look.z,
+                right.x*look.y - right.y*look.x };
+    int n = g_multipoint_count;
+    if (n < 3) n = 3;
+    if (n > 12) n = 12;
+    for (int i = 0; i < n; i++) {
+        float ang = (2.0f * (float)M_PI) * ((float)i / (float)n);
+        float ox = cosf(ang), oy = sinf(ang);
+        Vector3 p;
+        p.x = center.x + right.x*ox*radius + up.x*oy*radius;
+        p.y = center.y + right.y*ox*radius + up.y*oy*radius;
+        p.z = center.z + right.z*ox*radius + up.z*oy*radius;
+        if (fn(p)) return;
+    }
 }
 
 // Resolve exactly like the Android source: NO il2cpp_domain_get (that hung),
@@ -1007,7 +1055,7 @@ static void compute_boxes() {
 // touch-drag code writes every frame, so the camera visibly turns exactly
 // like a real drag would. Target = nearest-to-screen-center living enemy
 // within g_aimbot_fov_px, aimed at a real bone when available (else the flat
-// Pos field), eased in by g_aimbot_smooth so it doesn't snap instantly.
+// Pos field), turned toward at a constant g_aimbot_turn_speed_dps so it never snaps.
 //
 // MUST run from inside the SetInputs hook below, not an async timer: a plain
 // periodic field write got silently overwritten every frame by the game's
@@ -1067,6 +1115,26 @@ static Quat quat_slerp(Quat a, Quat b, float t) {
     float n = sqrtf(r.x*r.x + r.y*r.y + r.z*r.z + r.w*r.w);
     if (n > 0.0001f) { r.x/=n; r.y/=n; r.z/=n; r.w/=n; }
     return r;
+}
+
+// Steps `from` toward `to` at a constant angular speed (degrees/sec), not a
+// fixed percentage of the remaining gap. Fixes two symptoms of the old
+// fixed-fraction slerp in one shot: a fresh, large gap (first frame after
+// acquiring a target) is capped to the exact same max-degrees-per-frame as
+// every other frame — so acquisition can never produce a sudden jump/jerk —
+// and a shrinking gap (converging onto a now-stationary target) keeps
+// closing at that same constant rate instead of decaying into an
+// imperceptible asymptotic crawl that reads as "stopped tracking".
+static Quat quat_step_toward(Quat from, Quat to, float maxDegPerSec, float dt) {
+    float dot = from.x*to.x + from.y*to.y + from.z*to.z + from.w*to.w;
+    float dotAbs = dot < 0.0f ? -dot : dot;
+    if (dotAbs > 1.0f) dotAbs = 1.0f;
+    float angleDeg = 2.0f * acosf(dotAbs) * (180.0f / (float)M_PI);
+    if (angleDeg < 0.0001f) return to;
+    float maxStepDeg = maxDegPerSec * dt;
+    float t = maxStepDeg / angleDeg;
+    if (t >= 1.0f) return to;   // within one step of the target — snap exactly, no residual crawl
+    return quat_slerp(from, to, t);
 }
 
 // Shared target-finding logic: enumerate PLH players, pick the closest one
@@ -1163,32 +1231,17 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
 
     void* cam; Vector3 eye, aimPoint;
     if (!find_aim_target(cam, eye, aimPoint)) {
-        // RELEASE PHASE, full-lock mode only (assist mode never sets
-        // g_aim_state_valid — see below — so it never reaches here; it was
-        // already tracking the real value every tick, nothing to hand back).
-        // A hard stop the instant the target disappears meant the game's own
-        // real/manual rotation — which had kept updating underneath our
-        // override the whole time — snapped the visible camera straight back
-        // to wherever it now was, since nothing eased the gap. Instead, keep
-        // blending our own state toward the REAL current value for a few
-        // more ticks until they're close, then let go for real.
-        if (!g_aim_state_valid) return;
-        Quat* curRel = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
-        const float releaseT = 0.15f;
-        Quat released = quat_slerp(g_aim_state_quat, *curRel, releaseT);
-        g_aim_state_quat = released;
-
-        float dotv = released.x*curRel->x + released.y*curRel->y + released.z*curRel->z + released.w*curRel->w;
-        if (dotv < 0.0f) dotv = -dotv;
-        if (dotv > 1.0f) dotv = 1.0f;
-        float angleDiffDeg = 2.0f * acosf(dotv) * (180.0f / (float)M_PI);
-        if (angleDiffDeg < 0.5f) { g_aim_state_valid = false; return; } // close enough — fully let go
-
-        *curRel = released;
-        if (Tf_set_rotation) {
-            void* camTfRel = Camera_get_main ? Comp_get_tf(Camera_get_main(NULL), NULL) : NULL;
-            if (safe_ptr(camTfRel)) Tf_set_rotation(camTfRel, released, NULL);
-        }
+        // Target lost (full-lock mode only — assist mode never sets
+        // g_aim_state_valid, so it never reaches here; it was already
+        // tracking the real value every tick, nothing to hand back). Used to
+        // ease the hand-back over a few ticks, but that read as the camera
+        // still being dragged around on its own for a beat after letting go
+        // — so instead just stop overriding immediately. Full lock never
+        // moves the "real" value out from under itself while it's locked
+        // (nothing else is dragging the camera meanwhile), so there's
+        // nothing to snap back TO here — letting go is a true no-op on the
+        // very next tick.
+        g_aim_state_valid = false;
         return;
     }
 
@@ -1211,7 +1264,8 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     // this frame, not after.
     Quat targetQ = euler_to_quat_unity(pitch, yaw, 0.0f);
     Quat* cur = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
-    float t = g_aimbot_smooth; if (t < 0.02f) t = 0.02f; if (t > 1.0f) t = 1.0f;
+    float turnSpeed = g_aimbot_turn_speed_dps; if (turnSpeed < 10.0f) turnSpeed = 10.0f;
+    const float dt = 1.0f / 60.0f;
 
     Quat blendFrom;
     if (g_assist_mode) {
@@ -1235,10 +1289,10 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         blendFrom = g_aim_state_quat;
     }
 
-    // True slerp (quat_slerp handles the double-cover shortest-path flip
-    // internally) instead of plain lerp+normalize, since nlerp's angular
-    // speed isn't constant across the arc.
-    Quat blended = quat_slerp(blendFrom, targetQ, t);
+    // Constant-angular-speed step (quat_step_toward), not a fixed-fraction
+    // slerp — see its own comment for why: no jerk on acquisition, no stall
+    // once converged onto a stationary target.
+    Quat blended = quat_step_toward(blendFrom, targetQ, turnSpeed, dt);
     if (!g_assist_mode) g_aim_state_quat = blended;
     *cur = blended;
 
@@ -1364,7 +1418,7 @@ static bool save_config(const std::string& name) {
     f << "aimbot_on=" << (g_aimbot_on?1:0) << "\n";
     f << "assist_mode=" << (g_assist_mode?1:0) << "\n";
     f << "aimbot_fov_px=" << g_aimbot_fov_px << "\n";
-    f << "aimbot_smooth=" << g_aimbot_smooth << "\n";
+    f << "aimbot_turn_speed_dps=" << g_aimbot_turn_speed_dps << "\n";
     f << "aimbot_wallcheck=" << (g_aimbot_wallcheck?1:0) << "\n";
     f << "multipoint_on=" << (g_multipoint_on?1:0) << "\n";
     f << "multipoint_count=" << g_multipoint_count << "\n";
@@ -1408,7 +1462,7 @@ static bool load_config(const std::string& name) {
         else if (key=="aimbot_on") g_aimbot_on = (val=="1");
         else if (key=="assist_mode") g_assist_mode = (val=="1");
         else if (key=="aimbot_fov_px") g_aimbot_fov_px = (float)atof(val.c_str());
-        else if (key=="aimbot_smooth") g_aimbot_smooth = (float)atof(val.c_str());
+        else if (key=="aimbot_turn_speed_dps") g_aimbot_turn_speed_dps = (float)atof(val.c_str());
         else if (key=="aimbot_wallcheck") g_aimbot_wallcheck = (val=="1");
         else if (key=="multipoint_on") g_multipoint_on = (val=="1");
         else if (key=="multipoint_count") g_multipoint_count = atoi(val.c_str());
@@ -1441,7 +1495,11 @@ static void render_frame(float screenW, float screenH) {
     if (g_menu_open) {
     ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(30, 40), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(380, 9999));
+    // Was capped at 380px wide — too narrow for this content at any font
+    // size, which is why labels like "Trigger radius (px)"/"Reaction min
+    // (ms)" were getting clipped off the right edge, and the window couldn't
+    // be resized past it to compensate. Let it go as wide as the screen.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(240, 0), ImVec2(screenW > 0 ? screenW - 20 : 900.0f, 9999));
     ImGui::Begin("Blockpost ESP");
     {
         ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
@@ -1473,8 +1531,8 @@ static void render_frame(float screenW, float screenH) {
                 ImGui::Checkbox("Assist mode", &g_assist_mode);
                 ImGui::SameLine(); ImGui::TextDisabled("(nudges toward target, composes with manual aim instead of overriding it)");
                 ImGui::SliderFloat("FOV (px)", &g_aimbot_fov_px, 20.0f, 600.0f);
-                ImGui::SliderFloat("Smoothness", &g_aimbot_smooth, 0.02f, 1.0f);
-                ImGui::SameLine(); ImGui::TextDisabled("(low=slow, 1=instant snap)");
+                ImGui::SliderFloat("Turn speed (deg/s)", &g_aimbot_turn_speed_dps, 60.0f, 3000.0f);
+                ImGui::SameLine(); ImGui::TextDisabled("(constant speed — never jerks, never stalls)");
                 ImGui::Checkbox("Wallcheck", &g_aimbot_wallcheck);
 
                 ImGui::SeparatorText("Multipoints");
@@ -1915,11 +1973,16 @@ static void inject_tap(CGPoint point) {
 
 // Triggerbot's own condition check, deliberately independent of the visual
 // aimbot/assist state — works with pure manual aiming too, exactly like a
-// standalone triggerbot should. Projects every SELECTED hitbox on every
-// valid enemy to screen space and checks whether ANY of them sits within
-// g_trigger_radius_px of the crosshair (screen center).
+// standalone triggerbot should. Used to only test each selected bone's flat
+// CENTER point — but with multipoint on, the aimbot/ESP already treat the
+// hitbox as the whole sampled ring, not just its center, so a crosshair
+// sitting on a visible EDGE of the hitbox (peeking a sliver of head over
+// cover, say) looked "on target" visually but the trigger's own center-only
+// check disagreed and never fired. Now tests every multipoint sample of the
+// hitbox (via for_each_hitbox_sample_point, same ring as the aimbot uses) —
+// ANY of them within g_trigger_radius_px of the crosshair counts.
 static bool crosshair_on_selected_hitbox() {
-    if (!g_resolved || !W2S || !Camera_get_main) return false;
+    if (!g_resolved || !W2S || !Camera_get_main || !Comp_get_tf || !Tf_get_pos) return false;
     void* cam = Camera_get_main(NULL);
     if (!cam) return false;
     float gameW = Camera_get_pixelWidth  ? (float)Camera_get_pixelWidth(cam, NULL)  : g_scrW;
@@ -1929,6 +1992,10 @@ static bool crosshair_on_selected_hitbox() {
     if (g_scrW <= 0 || g_scrH <= 0 || gameW <= 0 || gameH <= 0) return false;
     const float sx = g_scrW / gameW, sy = g_scrH / gameH;
     const float cxScreen = g_scrW * 0.5f, cyScreen = g_scrH * 0.5f;
+
+    void* camTf = Comp_get_tf(cam, NULL);
+    if (!safe_ptr(camTf)) return false;
+    Vector3 eye = Tf_get_pos(camTf, NULL);
 
     std::vector<void*> players;
     enum_plh_players(players);
@@ -1949,13 +2016,19 @@ static bool crosshair_on_selected_hitbox() {
         for (int bi = 0; bi < kAllBoneCount; bi++) {
             int boneIdx = kAllBoneIndices[bi];
             if (!g_hitbox_sel[boneIdx]) continue;
-            Vector3 p;
-            if (!get_bone_pos(obj, boneIdx, p)) continue;
-            Vector3 s = W2S(cam, p, NULL);
-            if (s.z <= 0.0f) continue;
-            float ux = s.x * sx, uy = g_scrH - (s.y * sy);
-            float dx = ux - cxScreen, dy = uy - cyScreen;
-            if (dx*dx + dy*dy <= g_trigger_radius_px * g_trigger_radius_px) return true;
+            Vector3 center;
+            if (!get_bone_pos(obj, boneIdx, center)) continue;
+
+            bool hit = false;
+            for_each_hitbox_sample_point(eye, center, kBoneVisRadius, g_multipoint_on, [&](Vector3 p) {
+                Vector3 s = W2S(cam, p, NULL);
+                if (s.z <= 0.0f) return false;
+                float ux = s.x * sx, uy = g_scrH - (s.y * sy);
+                float dx = ux - cxScreen, dy = uy - cyScreen;
+                if (dx*dx + dy*dy <= g_trigger_radius_px * g_trigger_radius_px) { hit = true; return true; }
+                return false;
+            });
+            if (hit) return true;
         }
     }
     return false;
@@ -2055,10 +2128,19 @@ static void setup_overlay() {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = NULL;
-    io.FontGlobalScale = 1.4f;
+    // Menu used to look huge AND blurry: default font baked at 13px, then
+    // stretched 1.4x via FontGlobalScale (a bitmap upscale — blur, not
+    // sharpness) on top of a 1.3x style scale. Bake the font at its real
+    // target size instead (crisp, no upscale blur) and drop the style scale
+    // back to normal — this only shrinks/sharpens the SETTINGS MENU, not the
+    // in-world ESP boxes/skeleton, which are drawn separately in screen space.
+    ImFontConfig fontCfg;
+    fontCfg.SizePixels = 18.0f;
+    io.Fonts->AddFontDefault(&fontCfg);
+    io.FontGlobalScale = 1.0f;
     ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(1.3f);
-    ImGui::GetStyle().TouchExtraPadding = ImVec2(6.0f, 6.0f);  // finger-sized hit targets, incl. the resize grip
+    ImGui::GetStyle().ScaleAllSizes(1.0f);
+    ImGui::GetStyle().TouchExtraPadding = ImVec2(5.0f, 5.0f);  // finger-sized hit targets, incl. the resize grip
     ImGui_ImplMetal_Init(device);
 
     g_renderer = [ESPRenderer new];

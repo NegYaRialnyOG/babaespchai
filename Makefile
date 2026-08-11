@@ -11,4 +11,10 @@ BlockpostESP_CFLAGS = -fobjc-arc -Iimgui -Iimgui/backends -Wno-unused-variable -
 BlockpostESP_CCFLAGS = -std=c++17
 BlockpostESP_FRAMEWORKS = UIKit CoreGraphics QuartzCore Metal MetalKit Foundation IOKit
 
+# The triggerbot injects taps at the IOHID layer (IOHIDEventSystemClientDispatchEvent)
+# so it works regardless of how the target app dispatches touches. That call is a
+# no-op without this entitlement — without it, IOHID silently accepts the event and
+# does nothing, which is exactly the "fired=N but nothing happens in-game" symptom.
+BlockpostESP_CODESIGN_FLAGS = -Sentitlements.plist
+
 include $(THEOS_MAKE_PATH)/tweak.mk

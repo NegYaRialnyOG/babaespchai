@@ -216,6 +216,14 @@ static float     g_aimbot_smooth     = 0.25f;   // 0..1 lerp factor per tick tow
 static int       g_aimbot_bone       = BONE_CHEST; // which bone to aim at, when bones are available
 static bool      g_aimbot_wallcheck  = true;   // skip targets with no clear line of sight (Physics.Raycast)
 static bool      g_silent_on         = false;  // silent aim: spoof server-side rotation via Client::send_pos, screen never turns
+static int       g_silent_active     = -1;     // which of the 5 send_pos candidates actually gets the rotation override; -1 = none yet (pure observation)
+static bool      g_aim_locked_on_target = false; // true this tick when the ALREADY-APPLIED visual aim is within threshold of the current target — Auto Shoot's gate
+static bool      g_autoshoot_on         = false;
+static float     g_autoshoot_angle_thresh = 3.0f;  // degrees — how close the rendered view must already be to the target before firing
+static float     g_autoshoot_cooldown     = 0.25f; // seconds between simulated taps
+static float     g_autoshoot_offset_x     = 0.0f, g_autoshoot_offset_y = 0.0f; // calibration offset from screen center for the simulated tap
+static double    g_autoshoot_last_fire_time = 0.0;
+static long      g_autoshoot_fire_count     = 0;
 // Persistent aim-turn state, updated ourselves frame-to-frame instead of
 // re-reading the inputs struct's "cur" field as the slerp start point. The
 // struct's field turned out to reflect the game's own (untouched, since the
@@ -527,6 +535,7 @@ static bool find_visible_point_near(Vector3 eye, Vector3 center, float radius, V
 // layout, not just a renamed one).
 static void install_aimbot_hook();  // defined below; forward-declared for use here
 static void install_silent_hook();  // defined below; forward-declared for use here
+static void maybe_autoshoot();      // defined below (needs find_game_root_view); forward-declared for use in main_pump
 static void resolve_all() {
     write_step(10); bind_pointers();
     install_aimbot_hook();
@@ -1083,18 +1092,18 @@ static bool find_aim_target(void*& outCam, Vector3& outEye, Vector3& outAimPoint
 }
 
 static void apply_aimbot(void* controller, void* inputsPtr) {
-    if (!g_aimbot_on) { g_aim_state_valid = false; return; }
-    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; return; }
+    if (!g_aimbot_on) { g_aim_state_valid = false; g_aim_locked_on_target = false; return; }
+    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; g_aim_locked_on_target = false; return; }
 
     void* cam; Vector3 eye, aimPoint;
-    if (!find_aim_target(cam, eye, aimPoint)) { g_aim_state_valid = false; return; }
+    if (!find_aim_target(cam, eye, aimPoint)) { g_aim_state_valid = false; g_aim_locked_on_target = false; return; }
 
     // Pitch/yaw from eye->target, exactly matching the reference's calcAngle
     // (note: delta is eye-minus-target, not target-minus-eye — the sign
     // convention the atan2/asin below are built around).
     Vector3 d{ eye.x - aimPoint.x, eye.y - aimPoint.y, eye.z - aimPoint.z };
     float mag = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
-    if (mag < 0.001f) { g_aim_state_valid = false; return; }
+    if (mag < 0.001f) { g_aim_state_valid = false; g_aim_locked_on_target = false; return; }
     const float r2d = 180.0f / (float)M_PI;
     float pitch = asinf(d.y / mag) * r2d;
     float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
@@ -1121,6 +1130,20 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     // instead of plain lerp+normalize, since nlerp's angular speed isn't
     // constant across the arc.
     if (!g_aim_state_valid) { g_aim_state_quat = *cur; g_aim_state_valid = true; }
+
+    // Auto Shoot's gate: compare where the camera IS ALREADY rendering
+    // (g_aim_state_quat, before this tick's step) against the target — not
+    // the post-update value, since that would fire a tick early, before the
+    // player would actually visually see the crosshair land on the enemy.
+    {
+        float dotv = g_aim_state_quat.x*targetQ.x + g_aim_state_quat.y*targetQ.y
+                   + g_aim_state_quat.z*targetQ.z + g_aim_state_quat.w*targetQ.w;
+        if (dotv < 0.0f) dotv = -dotv; // double cover
+        if (dotv > 1.0f) dotv = 1.0f;
+        float angleDiffDeg = 2.0f * acosf(dotv) * (180.0f / (float)M_PI);
+        g_aim_locked_on_target = (angleDiffDeg <= g_autoshoot_angle_thresh);
+    }
+
     Quat blended = quat_slerp(g_aim_state_quat, targetQ, t);
     g_aim_state_quat = blended;
     *cur = blended;
@@ -1169,30 +1192,46 @@ static void install_aimbot_hook() {
 }
 
 // ---------------------------------------------------------------------------
-// Silent aim: Client::send_pos hook. This is the actual per-tick network
-// position/rotation report — same function the reference cheat's own source
-// hooks (Hooks::New_Client$$send_pos in hooks.cpp, "LMJBEIGNJIK" in their
-// build). Their build's obfuscated name is useless to us (obfuscation is
-// randomized per compile), but the C# CLASS name "Client" isn't obfuscated,
-// and the reference's own confirmed signature — 5 floats + 1 byte — turned
-// out to be UNIQUE across every method in our own dump's Client class (only
-// one match: MDPEDGFFIFI @ RVA 0x34BFF90). That's what actually disambiguates
-// it — earlier in this project there were multiple same-shaped candidates
-// around this class and no safe way to pick blind; the reference gave us the
-// real parameter count/types to match structurally instead of guessing.
+// Silent aim: Client::send_pos hook.
 //
-// Overriding the rotation args here and letting the ORIGINAL still run makes
-// the SERVER believe we're looking at the target — hit registration uses
-// that server-side rotation. Our own camera/Transform is never touched, so
-// nothing on screen turns: that's the entire difference from the visual
-// aimbot above.
-#define RVA_CLIENT_SEND_POS 0x34BFF90
+// CORRECTION from the previous build: it shipped hooking a single candidate
+// (MDPEDGFFIFI @ 0x34BFF90) on the claim that the reference's confirmed
+// signature — 5 floats + 1 byte — was unique across our own dump's Client
+// class. That check only scanned a truncated slice of the class body and
+// was WRONG: a full scan of the entire class (all ~960 lines) shows FIVE
+// methods share that exact signature — MDPEDGFFIFI, CMHFMKEFEEI, ONPKEPCMMGL,
+// HBOAEAHJNFK, GEPNJJFLFMG — the same 5 candidates flagged much earlier this
+// session as "signature-identical, no safe way to disambiguate". That's
+// almost certainly why silent aim didn't work: wrong candidate hooked (or a
+// candidate that's simply never invoked during normal position updates).
+//
+// Fix: hook all 5, but PASSIVELY — every hook logs its own call count and
+// last args and always calls straight through UNMODIFIED. None of the 5 get
+// their behavior altered by default, so a wrong guess costs nothing (no
+// crash/misbehavior risk, unlike blindly overriding args on the wrong one).
+// Open the menu during a live match, move around, and watch which sp[N]
+// increments continuously with rx/ry/rz values that track actual movement —
+// that's the real send_pos. Pick it via "Active candidate" in the menu, and
+// ONLY THEN does that one candidate get the rotation-override logic.
+#define SILENT_CANDIDATE_COUNT 5
+static const uintptr_t kSilentCandidateRVA[SILENT_CANDIDATE_COUNT] = {
+    0x34BFF90, 0x34C5E1C, 0x34C61A0, 0x34C8238, 0x34CE3E8
+};
 typedef void (*Client_SendPos_t)(void*, float, float, float, float, float, uint8_t, void*);
-static Client_SendPos_t Orig_Client_SendPos = NULL;
-static bool g_silent_hook_installed = false;
+static Client_SendPos_t Orig_Client_SendPos[SILENT_CANDIDATE_COUNT] = {NULL, NULL, NULL, NULL, NULL};
+static long   g_silent_calls[SILENT_CANDIDATE_COUNT]   = {0, 0, 0, 0, 0};
+static float  g_silent_last_rx[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
+static float  g_silent_last_ry[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
+static float  g_silent_last_rz[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
+static float  g_silent_last_lx[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
+static float  g_silent_last_ly[SILENT_CANDIDATE_COUNT] = {0, 0, 0, 0, 0};
+static bool   g_silent_hook_installed = false;
 
-static void Hook_Client_SendPos(void* thiz, float rx, float ry, float rz, float lx, float ly, uint8_t bitmask, void* method) {
-    if (g_silent_on) {
+static void silent_candidate_tick(int idx, void* thiz, float rx, float ry, float rz, float lx, float ly, uint8_t bitmask, void* method) {
+    g_silent_calls[idx]++;
+    g_silent_last_rx[idx] = rx; g_silent_last_ry[idx] = ry; g_silent_last_rz[idx] = rz;
+    g_silent_last_lx[idx] = lx; g_silent_last_ly[idx] = ly;
+    if (g_silent_on && g_silent_active == idx) {
         void* cam; Vector3 eye, aimPoint;
         if (find_aim_target(cam, eye, aimPoint)) {
             Vector3 d{ eye.x - aimPoint.x, eye.y - aimPoint.y, eye.z - aimPoint.z };
@@ -1206,17 +1245,36 @@ static void Hook_Client_SendPos(void* thiz, float rx, float ry, float rz, float 
                 // rotation representation expects that range, not signed
                 // -180..180. Yaw is left as-is, matching the reference.
                 if (pitch < 0.0f) pitch += 360.0f;
-                if (Orig_Client_SendPos) { Orig_Client_SendPos(thiz, rx, ry, rz, pitch, yaw, bitmask, method); return; }
+                if (Orig_Client_SendPos[idx]) { Orig_Client_SendPos[idx](thiz, rx, ry, rz, pitch, yaw, bitmask, method); return; }
             }
         }
     }
-    if (Orig_Client_SendPos) Orig_Client_SendPos(thiz, rx, ry, rz, lx, ly, bitmask, method);
+    if (Orig_Client_SendPos[idx]) Orig_Client_SendPos[idx](thiz, rx, ry, rz, lx, ly, bitmask, method);
 }
+
+#define DEFINE_SILENT_HOOK(N) \
+static void Hook_Client_SendPos_##N(void* thiz, float rx, float ry, float rz, float lx, float ly, uint8_t bitmask, void* method) { \
+    silent_candidate_tick(N, thiz, rx, ry, rz, lx, ly, bitmask, method); \
+}
+DEFINE_SILENT_HOOK(0)
+DEFINE_SILENT_HOOK(1)
+DEFINE_SILENT_HOOK(2)
+DEFINE_SILENT_HOOK(3)
+DEFINE_SILENT_HOOK(4)
+#undef DEFINE_SILENT_HOOK
+
+typedef void (*SilentHookFn_t)(void*, float, float, float, float, float, uint8_t, void*);
+static const SilentHookFn_t kSilentHookFns[SILENT_CANDIDATE_COUNT] = {
+    Hook_Client_SendPos_0, Hook_Client_SendPos_1, Hook_Client_SendPos_2,
+    Hook_Client_SendPos_3, Hook_Client_SendPos_4
+};
 
 static void install_silent_hook() {
     if (g_silent_hook_installed || !g_image_base) return;
-    void* target = (void*)(g_image_base + RVA_CLIENT_SEND_POS);
-    MSHookFunction(target, (void*)Hook_Client_SendPos, (void**)&Orig_Client_SendPos);
+    for (int i = 0; i < SILENT_CANDIDATE_COUNT; i++) {
+        void* target = (void*)(g_image_base + kSilentCandidateRVA[i]);
+        MSHookFunction(target, (void*)kSilentHookFns[i], (void**)&Orig_Client_SendPos[i]);
+    }
     g_silent_hook_installed = true;
 }
 
@@ -1240,6 +1298,7 @@ static void main_pump() {
     // Aimbot itself now runs from inside the SetInputs hook (installed once
     // in resolve_all), not here — see apply_aimbot's comment for why a plain
     // periodic write from this timer never survived to be used.
+    maybe_autoshoot(); // main-thread only (UIKit touch injection) — this timer already runs on the main thread
 }
 
 // Menu visibility, toggled by a 3-finger double-tap anywhere on screen (see
@@ -1302,6 +1361,17 @@ static void render_frame(float screenW, float screenH) {
             ImGui::SameLine(); ImGui::TextDisabled("(turns the camera)");
             ImGui::Checkbox("Silent aim", &g_silent_on);
             ImGui::SameLine(); ImGui::TextDisabled("(server-side only, screen never turns)");
+            {
+                static const char* candNames[] = {"none (observe only)","0","1","2","3","4"};
+                int candSel = g_silent_active + 1;
+                if (ImGui::Combo("send_pos candidate", &candSel, candNames, 6)) g_silent_active = candSel - 1;
+                ImGui::SameLine(); ImGui::TextDisabled("(pick after watching calls below while moving)");
+                for (int i = 0; i < SILENT_CANDIDATE_COUNT; i++) {
+                    ImGui::Text("sp[%d] calls=%ld rx=%.1f ry=%.1f rz=%.1f lx=%.1f ly=%.1f",
+                                i, g_silent_calls[i], g_silent_last_rx[i], g_silent_last_ry[i],
+                                g_silent_last_rz[i], g_silent_last_lx[i], g_silent_last_ly[i]);
+                }
+            }
             ImGui::SliderFloat("FOV (px)", &g_aimbot_fov_px, 20.0f, 600.0f);
             ImGui::SliderFloat("Smoothness (visual)", &g_aimbot_smooth, 0.02f, 1.0f);
             ImGui::SameLine(); ImGui::TextDisabled("(low=slow/smooth, 1=instant snap)");
@@ -1313,6 +1383,16 @@ static void render_frame(float screenW, float screenH) {
             }
             ImGui::Checkbox("Wallcheck", &g_aimbot_wallcheck);
             ImGui::SameLine(); ImGui::TextDisabled("(skip targets with no clear line of sight)");
+
+            ImGui::SeparatorText("Auto Shoot (experimental)");
+            ImGui::Checkbox("Auto Shoot", &g_autoshoot_on);
+            ImGui::SameLine(); ImGui::TextDisabled("(fires only once visual aim is ON target)");
+            ImGui::SliderFloat("Lock threshold (deg)", &g_autoshoot_angle_thresh, 0.5f, 15.0f);
+            ImGui::SliderFloat("Cooldown (s)", &g_autoshoot_cooldown, 0.05f, 1.0f);
+            ImGui::SliderFloat("Tap offset X", &g_autoshoot_offset_x, -300.0f, 300.0f);
+            ImGui::SliderFloat("Tap offset Y", &g_autoshoot_offset_y, -300.0f, 300.0f);
+            ImGui::Text("locked=%d  fired=%ld", g_aim_locked_on_target ? 1 : 0, g_autoshoot_fire_count);
+            ImGui::SameLine(); ImGui::TextDisabled("(needs visual Aimbot ON; uses private UITouch API, may need offset tuning)");
         }
 
         if (ImGui::CollapsingHeader("Target / offsets (advanced)")) {
@@ -1571,6 +1651,76 @@ static UIView* find_game_root_view() {
         if (w.rootViewController) return w.rootViewController.view;
     }
     return nil;
+}
+
+// ---------------------------------------------------------------------------
+// Auto Shoot: fires by simulating a real tap on the game's own view, NOT by
+// calling any native fire function directly. The actual fire RPC
+// (Client::send_attackv2) has the SAME kind of ambiguity send_pos had — 0
+// explicit C# params, so signature matching gives zero narrowing at all, and
+// there are dozens of same-shaped candidates in Client alone. A wrong call
+// there is far riskier than a wrong PASSIVE hook (send_pos's fix above):
+// it's an unverified void function pointer invoked every tick the condition
+// holds, with completely unknown side effects. So instead of guessing,
+// this synthesizes the exact input a real player already gives to shoot —
+// a tap on the game view — using UIKit's PRIVATE UITouch construction
+// (undocumented, version-sensitive; a long-standing technique in jailbreak
+// "autotap" tooling). Every step is guarded (respondsToSelector / @try) so
+// a shape mismatch on some iOS version just silently no-ops instead of
+// crashing — this is genuinely best-effort and may need adjusting once
+// tested for real.
+static void inject_tap(CGPoint point) {
+    UIView* root = find_game_root_view();
+    if (!root) return;
+
+    Class touchClass = NSClassFromString(@"UITouch");
+    if (!touchClass) return;
+    id touch = [[touchClass alloc] init];
+    if (!touch) return;
+
+    @try {
+        [touch setValue:root.window forKey:@"_window"];
+        [touch setValue:root forKey:@"_view"];
+        [touch setValue:@1 forKey:@"_tapCount"];
+        [touch setValue:@([[NSProcessInfo processInfo] systemUptime]) forKey:@"_timestamp"];
+        [touch setValue:@0 forKey:@"_phase"]; // UITouchPhaseBegan
+    } @catch (...) { return; }
+
+    SEL setLoc = NSSelectorFromString(@"_setLocationInWindow:resetPrevious:");
+    if (![touch respondsToSelector:setLoc]) return;
+    @try {
+        NSMethodSignature* sig = [touch methodSignatureForSelector:setLoc];
+        NSInvocation* inv = [NSInvocation invocationWithMethodSignature:sig];
+        inv.selector = setLoc;
+        BOOL resetPrev = YES;
+        [inv setArgument:&point atIndex:2];
+        [inv setArgument:&resetPrev atIndex:3];
+        [inv invokeWithTarget:touch];
+    } @catch (...) { return; }
+
+    NSSet* touchSet = [NSSet setWithObject:touch];
+    id event = [[NSClassFromString(@"UITouchesEvent") alloc] init];
+    if ([root respondsToSelector:@selector(touchesBegan:withEvent:)]) {
+        [root touchesBegan:touchSet withEvent:event];
+    }
+    // Release phase a beat later — a brief tap, not a held-down touch.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @try { [touch setValue:@3 forKey:@"_phase"]; } @catch (...) { return; } // UITouchPhaseEnded
+        if ([root respondsToSelector:@selector(touchesEnded:withEvent:)]) {
+            [root touchesEnded:touchSet withEvent:event];
+        }
+    });
+}
+
+static void maybe_autoshoot() {
+    if (!g_autoshoot_on || !g_aimbot_on || !g_aim_locked_on_target) return;
+    if (g_scrW <= 0 || g_scrH <= 0) return;
+    double now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - g_autoshoot_last_fire_time < g_autoshoot_cooldown) return;
+    g_autoshoot_last_fire_time = now;
+    g_autoshoot_fire_count++;
+    CGPoint p = CGPointMake(g_scrW * 0.5f + g_autoshoot_offset_x, g_scrH * 0.5f + g_autoshoot_offset_y);
+    inject_tap(p);
 }
 
 static ESPWindow*   g_window   = nil;

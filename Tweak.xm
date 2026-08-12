@@ -2079,6 +2079,18 @@ IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(CFAllocatorRef allocator,
                                                     int range, int touch,
                                                     uint32_t options);
 void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
+// Missing piece found by cross-referencing a real working synthetic-touch
+// implementation (iolate/SimulateTouch): a sender ID must be stamped onto
+// the event BEFORE dispatch. Without it, IOHIDEventSystemClientDispatchEvent
+// still succeeds (no crash, no null return, our dispatch counter still
+// increments) but the event apparently never gets attributed to a real
+// digitizer service the app's touch pipeline listens to — dispatch
+// "succeeding" was never proof the app actually received a touch, just proof
+// the call didn't error out. 0xDEFACEDBEEFFECE5 is the sender ID value used
+// by that reference implementation and, per multiple other autotap/autotouch
+// jailbreak tools independently converging on the same constant, appears to
+// be what real digitizer services expect/accept here.
+void IOHIDEventSetSenderID(IOHIDEventRef event, uint64_t senderID);
 }
 
 // kIOHIDDigitizerEventRange / kIOHIDDigitizerEventTouch — bit 0 / bit 1 of
@@ -2106,6 +2118,7 @@ static void hid_dispatch_finger(CGPoint pt, bool touching, uint32_t identity) {
         nx, ny, /*z*/ 0.0, /*tipPressure*/ touching ? 1.0 : 0.0, /*twist*/ 0.0,
         /*range*/ touching ? 1 : 0, /*touch*/ touching ? 1 : 0, /*options*/ 0);
     if (!ev) return;
+    IOHIDEventSetSenderID(ev, 0xDEFACEDBEEFFECE5ULL);
     IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
     g_hid_dispatch_count++;
     g_hid_last_tap_x = pt.x; g_hid_last_tap_y = pt.y;

@@ -292,6 +292,7 @@ static float     g_trigger_tap_x           = -1.0f, g_trigger_tap_y = -1.0f; // 
 // trigger debug line. Remove alongside that debug line once confirmed.
 static long      g_hid_dispatch_count      = 0;
 static bool      g_hid_client_ok           = false;
+static float     g_hid_last_tap_x          = -1.0f, g_hid_last_tap_y = -1.0f;
 // Persistent aim-turn state, updated ourselves frame-to-frame instead of
 // re-reading the inputs struct's "cur" field as the slerp start point. The
 // struct's field turned out to reflect the game's own (untouched, since the
@@ -1861,8 +1862,9 @@ static void render_frame(float screenW, float screenH) {
         }
         if (g_trigger_on) {
             char buf[160];
-            snprintf(buf, sizeof(buf), "trigger hid_ok=%d dispatched=%ld fired=%ld",
-                     g_hid_client_ok ? 1 : 0, g_hid_dispatch_count, g_trigger_fire_count);
+            snprintf(buf, sizeof(buf), "trigger hid_ok=%d dispatched=%ld fired=%ld tap=(%.0f,%.0f)",
+                     g_hid_client_ok ? 1 : 0, g_hid_dispatch_count, g_trigger_fire_count,
+                     g_hid_last_tap_x, g_hid_last_tap_y);
             draw_outlined_text(dl, ImVec2(10, y), IM_COL32(255,220,120,255), buf);
         }
     }
@@ -2088,7 +2090,7 @@ static IOHIDEventSystemClientRef g_hidClient = NULL;
 // (near g_trigger_fire_count) so render_frame can read them; defined here
 // only in the sense that this is where they get WRITTEN.
 
-static void hid_dispatch_finger(CGPoint pt, bool touching) {
+static void hid_dispatch_finger(CGPoint pt, bool touching, uint32_t identity) {
     if (!g_hidClient) g_hidClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
     g_hid_client_ok = (g_hidClient != NULL);
     if (!g_hidClient) return;
@@ -2099,21 +2101,32 @@ static void hid_dispatch_finger(CGPoint pt, bool touching) {
 
     IOHIDEventRef ev = IOHIDEventCreateDigitizerFingerEvent(
         kCFAllocatorDefault, mach_absolute_time(),
-        /*index*/ 1, /*identity*/ 2,
+        /*index*/ 1, identity,
         (kHIDDigitizerRange | kHIDDigitizerTouch),
         nx, ny, /*z*/ 0.0, /*tipPressure*/ touching ? 1.0 : 0.0, /*twist*/ 0.0,
         /*range*/ touching ? 1 : 0, /*touch*/ touching ? 1 : 0, /*options*/ 0);
     if (!ev) return;
     IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
     g_hid_dispatch_count++;
+    g_hid_last_tap_x = pt.x; g_hid_last_tap_y = pt.y;
     CFRelease(ev);
 }
 
+// `identity` is meant to uniquely track ONE continuous physical contact —
+// reusing the same fixed identity (was hardcoded =2) across many rapid
+// separate taps (triggerbot can fire every g_trigger_rapid_s, default
+// 0.15s) risks the digitizer state machine treating a new down as a
+// continuation of a not-yet-fully-released previous touch, especially with
+// only a 50ms gap between our own down/up. A fresh identity per tap avoids
+// that ambiguity — cheap, well-justified regardless of whether it turns out
+// to be the actual reason fires aren't landing.
 static void inject_tap(CGPoint point) {
-    hid_dispatch_finger(point, true);
+    static uint32_t s_next_identity = 100;  // clear of any real-finger identity range
+    uint32_t identity = s_next_identity++;
+    hid_dispatch_finger(point, true, identity);
     // Release phase a beat later — a brief tap, not a held-down touch.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        hid_dispatch_finger(point, false);
+        hid_dispatch_finger(point, false, identity);
     });
 }
 
@@ -2127,6 +2140,16 @@ static void inject_tap(CGPoint point) {
 // check disagreed and never fired. Now tests every multipoint sample of the
 // hitbox (via for_each_hitbox_sample_point, same ring as the aimbot uses) —
 // ANY of them within g_trigger_radius_px of the crosshair counts.
+//
+// Wallcheck: unlike find_aim_target (aimbot), this previously had NO
+// occlusion test at all — for_each_hitbox_sample_point only enumerates
+// screen-space sample points, it never calls bone_is_visible itself (that's
+// deliberate, see its own comment — a caller-supplied condition decides what
+// "hit" means). Triggerbot's condition here didn't supply one, so it fired
+// on any screen-space crosshair alignment even through walls/geometry,
+// completely ignoring the Wallcheck setting that visibly sits right above
+// Triggerbot in the same Combat tab. Fixed by gating each sample point on
+// bone_is_visible(eye, p) too, same as the aimbot already does.
 static bool crosshair_on_selected_hitbox() {
     if (!g_resolved || !W2S || !Camera_get_main || !Comp_get_tf || !Tf_get_pos) return false;
     void* cam = Camera_get_main(NULL);
@@ -2167,6 +2190,7 @@ static bool crosshair_on_selected_hitbox() {
 
             bool hit = false;
             for_each_hitbox_sample_point(eye, center, kBoneVisRadius, g_multipoint_on, [&](Vector3 p) {
+                if (g_aimbot_wallcheck && !bone_is_visible(eye, p)) return false;
                 Vector3 s = W2S(cam, p, NULL);
                 if (s.z <= 0.0f) return false;
                 float ux = s.x * sx, uy = g_scrH - (s.y * sy);

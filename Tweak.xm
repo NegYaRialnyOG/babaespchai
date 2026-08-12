@@ -1861,9 +1861,9 @@ static void render_frame(float screenW, float screenH) {
             y += 18.0f;
         }
         if (g_trigger_on) {
-            char buf[160];
-            snprintf(buf, sizeof(buf), "trigger hid_ok=%d dispatched=%ld fired=%ld tap=(%.0f,%.0f)",
-                     g_hid_client_ok ? 1 : 0, g_hid_dispatch_count, g_trigger_fire_count,
+            char buf[180];
+            snprintf(buf, sizeof(buf), "trigger wallcheck=%d hid_ok=%d dispatched=%ld fired=%ld tap=(%.0f,%.0f)",
+                     g_aimbot_wallcheck ? 1 : 0, g_hid_client_ok ? 1 : 0, g_hid_dispatch_count, g_trigger_fire_count,
                      g_hid_last_tap_x, g_hid_last_tap_y);
             draw_outlined_text(dl, ImVec2(10, y), IM_COL32(255,220,120,255), buf);
         }

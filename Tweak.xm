@@ -27,7 +27,7 @@
 // Bump this every release — shown in the always-on load indicator so it's
 // obvious whether the loader actually replaced the running dylib with the
 // latest one, vs a stale cached copy.
-#define BUILD_TAG "aimhook1"
+#define BUILD_TAG "v0.11.1-hidfix"
 
 static double g_overlay_start_time = 0;
 static bool   g_gesture_host_found = false;
@@ -286,6 +286,12 @@ static double    g_trigger_pending_until   = 0.0;
 static double    g_trigger_last_fire_time  = 0.0;
 static long      g_trigger_fire_count      = 0;
 static float     g_trigger_tap_x           = -1.0f, g_trigger_tap_y = -1.0f; // draggable marker; -1 = not yet placed (defaults to screen center once known)
+// Diagnostic-only (temporary): declared up here (not next to g_hidClient
+// below, where they're actually written) so render_frame — which comes
+// BEFORE the IOHID section in this file — can read them for the on-screen
+// trigger debug line. Remove alongside that debug line once confirmed.
+static long      g_hid_dispatch_count      = 0;
+static bool      g_hid_client_ok           = false;
 // Persistent aim-turn state, updated ourselves frame-to-frame instead of
 // re-reading the inputs struct's "cur" field as the slerp start point. The
 // struct's field turned out to reflect the game's own (untouched, since the
@@ -300,6 +306,13 @@ static float     g_trigger_tap_x           = -1.0f, g_trigger_tap_y = -1.0f; // 
 // stale value that might now point somewhere unrelated.
 static Quat      g_aim_state_quat{};
 static bool      g_aim_state_valid    = false;
+
+// Diagnostic-only (temporary): computed target vs actually-applied camera
+// orientation in human-readable euler degrees, for the on-screen aim debug
+// line — remove once the aim direction is confirmed correct on-device.
+static Vector3   g_aim_dbg_target_euler{};
+static Vector3   g_aim_dbg_applied_euler{};
+static bool      g_aim_dbg_valid       = false;
 
 static uintptr_t g_image_base = 0;
 static void*     g_dom        = NULL;   // il2cpp domain
@@ -1070,6 +1083,15 @@ static void compute_boxes() {
 
 // Unity's exact Quaternion.Euler formula (pitch=x, yaw=y, roll=z, degrees),
 // lifted directly from a working reference implementation for this game.
+// NOTE: kept for reference but NO LONGER USED by apply_aimbot (see
+// quat_look_rotation below) — user-reported symptom was "aim tracks the
+// target's movement correctly but points in a completely different
+// direction", i.e. right RELATIVE dynamics, wrong ABSOLUTE orientation.
+// That's the exact signature of an Euler axis-order/sign mistake: the
+// pitch/yaw NUMBERS can be computed correctly from geometry and still come
+// out of Quaternion.Euler() pointing the wrong way if this formula's axis
+// convention doesn't match the game's. Left in place only in case a future
+// diagnostic session needs to A/B it against the new approach.
 static Quat euler_to_quat_unity(float pitchDeg, float yawDeg, float rollDeg) {
     const float d2r = (float)M_PI / 180.0f;
     float cx = cosf(pitchDeg * d2r * 0.5f), sx = sinf(pitchDeg * d2r * 0.5f);
@@ -1081,6 +1103,79 @@ static Quat euler_to_quat_unity(float pitchDeg, float yawDeg, float rollDeg) {
     q.z = cx*cy*sz - cz*sx*sy;
     q.w = sx*sy*sz + cx*cy*cz;
     return q;
+}
+
+// Robust replacement for the euler_to_quat_unity path above: builds the
+// "look at target" quaternion DIRECTLY from the eye->target direction via a
+// right/up/forward basis + matrix->quaternion conversion (Shepperd's
+// method), instead of going through pitch/yaw/roll Euler angles at all.
+// This sidesteps Euler axis-order/sign pitfalls entirely — there is no
+// pitch/yaw/roll ordering to get subtly wrong, no atan2/asin sign-convention
+// trick needed. Cross-product order (cross(up, forward) for "right") is
+// Unity's own left-handed convention, verified against Unity's actual
+// coordinate axes (up=+Y, forward=+Z => right=+X).
+static Quat quat_look_rotation(Vector3 forward, Vector3 upHint) {
+    float flen = sqrtf(forward.x*forward.x + forward.y*forward.y + forward.z*forward.z);
+    if (flen < 0.0001f) return Quat{0.0f, 0.0f, 0.0f, 1.0f};
+    forward.x /= flen; forward.y /= flen; forward.z /= flen;
+
+    Vector3 right{ upHint.y*forward.z - upHint.z*forward.y,
+                   upHint.z*forward.x - upHint.x*forward.z,
+                   upHint.x*forward.y - upHint.y*forward.x };
+    float rlen = sqrtf(right.x*right.x + right.y*right.y + right.z*right.z);
+    if (rlen < 0.0001f) right = Vector3{1.0f, 0.0f, 0.0f};
+    else { right.x /= rlen; right.y /= rlen; right.z /= rlen; }
+
+    Vector3 up{ forward.y*right.z - forward.z*right.y,
+                forward.z*right.x - forward.x*right.z,
+                forward.x*right.y - forward.y*right.x };
+
+    float m00=right.x, m01=up.x, m02=forward.x;
+    float m10=right.y, m11=up.y, m12=forward.y;
+    float m20=right.z, m21=up.z, m22=forward.z;
+
+    Quat q;
+    float trace = m00 + m11 + m22;
+    if (trace > 0.0f) {
+        float s = sqrtf(trace + 1.0f) * 2.0f;
+        q.w = 0.25f * s;
+        q.x = (m21 - m12) / s;
+        q.y = (m02 - m20) / s;
+        q.z = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = sqrtf(1.0f + m00 - m11 - m22) * 2.0f;
+        q.w = (m21 - m12) / s;
+        q.x = 0.25f * s;
+        q.y = (m01 + m10) / s;
+        q.z = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        float s = sqrtf(1.0f + m11 - m00 - m22) * 2.0f;
+        q.w = (m02 - m20) / s;
+        q.x = (m01 + m10) / s;
+        q.y = 0.25f * s;
+        q.z = (m12 + m21) / s;
+    } else {
+        float s = sqrtf(1.0f + m22 - m00 - m11) * 2.0f;
+        q.w = (m10 - m01) / s;
+        q.x = (m02 + m20) / s;
+        q.y = (m12 + m21) / s;
+        q.z = 0.25f * s;
+    }
+    float n = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (n > 0.0001f) { q.x/=n; q.y/=n; q.z/=n; q.w/=n; }
+    return q;
+}
+
+// Debug-only: quaternion -> euler degrees, for on-screen diagnostic text.
+// Never used for actual aiming math, only for human-readable display.
+static Vector3 quat_to_euler_deg(Quat q) {
+    const float r2d = 180.0f / (float)M_PI;
+    Vector3 e;
+    float sinp = 2.0f*(q.w*q.x - q.y*q.z);
+    e.x = (fabsf(sinp) >= 1.0f ? copysignf((float)M_PI/2.0f, sinp) : asinf(sinp)) * r2d;
+    e.y = atan2f(2.0f*(q.w*q.y + q.z*q.x), 1.0f - 2.0f*(q.x*q.x + q.y*q.y)) * r2d;
+    e.z = atan2f(2.0f*(q.w*q.z + q.x*q.y), 1.0f - 2.0f*(q.y*q.y + q.z*q.z)) * r2d;
+    return e;
 }
 
 // Proper spherical interpolation (Shoemake). NLERP (plain lerp+normalize)
@@ -1226,8 +1321,8 @@ static bool find_aim_target(void*& outCam, Vector3& outEye, Vector3& outAimPoint
 }
 
 static void apply_aimbot(void* controller, void* inputsPtr) {
-    if (!g_aimbot_on) { g_aim_state_valid = false; return; }
-    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; return; }
+    if (!g_aimbot_on) { g_aim_state_valid = false; g_aim_dbg_valid = false; return; }
+    if (!safe_ptr(controller) || !safe_ptr(inputsPtr)) { g_aim_state_valid = false; g_aim_dbg_valid = false; return; }
 
     void* cam; Vector3 eye, aimPoint;
     if (!find_aim_target(cam, eye, aimPoint)) {
@@ -1242,18 +1337,19 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         // nothing to snap back TO here — letting go is a true no-op on the
         // very next tick.
         g_aim_state_valid = false;
+        g_aim_dbg_valid = false;
         return;
     }
 
-    // Pitch/yaw from eye->target, exactly matching the reference's calcAngle
-    // (note: delta is eye-minus-target, not target-minus-eye — the sign
-    // convention the atan2/asin below are built around).
-    Vector3 d{ eye.x - aimPoint.x, eye.y - aimPoint.y, eye.z - aimPoint.z };
-    float mag = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
-    if (mag < 0.001f) { g_aim_state_valid = false; return; }
-    const float r2d = 180.0f / (float)M_PI;
-    float pitch = asinf(d.y / mag) * r2d;
-    float yaw   = -1.0f * atan2f(d.x, -d.z) * r2d;
+    // Direction eye->target (NOT target->eye — this is the actual forward
+    // vector the camera should end up facing). Previously this went through
+    // an eye-minus-target sign trick feeding a hand-rolled pitch/yaw/atan2
+    // formula into euler_to_quat_unity; replaced with quat_look_rotation
+    // (see its own comment) which builds the quaternion directly from this
+    // vector — no Euler axis-order/sign convention involved at all anymore.
+    Vector3 forward{ aimPoint.x - eye.x, aimPoint.y - eye.y, aimPoint.z - eye.z };
+    float mag = sqrtf(forward.x*forward.x + forward.y*forward.y + forward.z*forward.z);
+    if (mag < 0.001f) { g_aim_state_valid = false; g_aim_dbg_valid = false; return; }
 
     // The field that steers the camera is a quaternion (m_qCameraRotation)
     // INSIDE the inputs struct passed to SetInputs, at offset 0x8 in OUR
@@ -1262,7 +1358,7 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
     // see g_ecc_camrot_off's declaration comment). Must be written BEFORE
     // calling the original SetInputs so the game actually consumes our value
     // this frame, not after.
-    Quat targetQ = euler_to_quat_unity(pitch, yaw, 0.0f);
+    Quat targetQ = quat_look_rotation(forward, Vector3{0.0f, 1.0f, 0.0f});
     Quat* cur = (Quat*)((char*)inputsPtr + g_ecc_camrot_off);
     float turnSpeed = g_aimbot_turn_speed_dps; if (turnSpeed < 10.0f) turnSpeed = 10.0f;
     const float dt = 1.0f / 60.0f;
@@ -1310,6 +1406,13 @@ static void apply_aimbot(void* controller, void* inputsPtr) {
         void* camTfForSet = Comp_get_tf(cam, NULL);
         if (safe_ptr(camTfForSet)) Tf_set_rotation(camTfForSet, blended, NULL);
     }
+
+    // Diagnostic only (see g_aim_dbg_* declaration) — lets a screenshot show
+    // exactly what we computed vs what we wrote, instead of guessing again
+    // if direction is still off after the quat_look_rotation switch.
+    g_aim_dbg_target_euler = quat_to_euler_deg(targetQ);
+    g_aim_dbg_applied_euler = quat_to_euler_deg(blended);
+    g_aim_dbg_valid = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,6 +1865,27 @@ static void render_frame(float screenW, float screenH) {
         }
     }
 
+    // Temporary diagnostics for the aim-direction and triggerbot-fire fixes —
+    // always visible (not gated on menu open) so they're screenshottable
+    // during a real match. Remove once both are confirmed working on-device.
+    {
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        float y = 32.0f;
+        if (g_aimbot_on && g_aim_dbg_valid) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "aim target=(p%.1f y%.1f) applied=(p%.1f y%.1f)",
+                     g_aim_dbg_target_euler.x, g_aim_dbg_target_euler.y,
+                     g_aim_dbg_applied_euler.x, g_aim_dbg_applied_euler.y);
+            draw_outlined_text(dl, ImVec2(10, y), IM_COL32(255,220,120,255), buf);
+            y += 18.0f;
+        }
+        if (g_trigger_on) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "trigger hid_ok=%d dispatched=%ld fired=%ld",
+                     g_hid_client_ok ? 1 : 0, g_hid_dispatch_count, g_trigger_fire_count);
+            draw_outlined_text(dl, ImVec2(10, y), IM_COL32(255,220,120,255), buf);
+        }
+    }
 
     { std::lock_guard<std::mutex> l(g_rects_mtx); g_capture_rects = rects; }
 }
@@ -1942,14 +2066,34 @@ typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 
 extern "C" {
 IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
+// Real signature per IOHIDEvent.h (IOKit private headers) — verified against
+// the actual header, NOT re-derived from memory. The PREVIOUS declaration
+// here had an extra bogus `uint32_t buttonMask` parameter that does not
+// exist in the real function, and used `float` for x/y/z/tipPressure/twist
+// where the real type (IOHIDFloat) is `double` on 64-bit (which is every
+// iOS device this runs on). Both are ABI-breaking: on arm64 AAPCS64,
+// integer/pointer args and float/double args are allocated into SEPARATE
+// register files (GPRs vs FPRs) independently, in declaration order within
+// each file. The bogus extra GPR-classified `buttonMask` argument shifted
+// every GPR arg after it by one slot — so what we thought was `buttonMask=0`
+// landed in the register the REAL function reads as `range`, meaning the
+// real `range` was ALWAYS 0 regardless of what we intended, and our real
+// `range`/`touch` values landed in the registers the real function reads as
+// `touch`/`options`. A digitizer event with range=false is never treated as
+// an actual finger touching the glass — this alone was enough to make
+// EVERY injected tap a silent no-op, independent of the HID entitlement
+// (which was already correctly present) or marker placement. The
+// float-vs-double mismatch on top of that would have corrupted the
+// coordinate/pressure values too. This is the actual root cause of
+// "выстрел не работает от слова совсем" — confirmed by cross-referencing
+// the real IOHIDEvent.h signature, not guessed.
 IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(CFAllocatorRef allocator,
                                                     uint64_t timeStamp,
                                                     uint32_t index,
                                                     uint32_t identity,
                                                     uint32_t eventMask,
-                                                    uint32_t buttonMask,
-                                                    float x, float y, float z,
-                                                    float tipPressure, float twist,
+                                                    double x, double y, double z,
+                                                    double tipPressure, double twist,
                                                     int range, int touch,
                                                     uint32_t options);
 void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
@@ -1960,23 +2104,28 @@ void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHID
 enum { kHIDDigitizerRange = 1 << 0, kHIDDigitizerTouch = 1 << 1 };
 
 static IOHIDEventSystemClientRef g_hidClient = NULL;
+// g_hid_dispatch_count / g_hid_client_ok are declared earlier in the file
+// (near g_trigger_fire_count) so render_frame can read them; defined here
+// only in the sense that this is where they get WRITTEN.
 
 static void hid_dispatch_finger(CGPoint pt, bool touching) {
     if (!g_hidClient) g_hidClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    g_hid_client_ok = (g_hidClient != NULL);
     if (!g_hidClient) return;
 
     CGRect bounds = [UIScreen mainScreen].bounds;
-    float nx = (bounds.size.width  > 0) ? (float)(pt.x / bounds.size.width)  : 0.0f;
-    float ny = (bounds.size.height > 0) ? (float)(pt.y / bounds.size.height) : 0.0f;
+    double nx = (bounds.size.width  > 0) ? (double)(pt.x / bounds.size.width)  : 0.0;
+    double ny = (bounds.size.height > 0) ? (double)(pt.y / bounds.size.height) : 0.0;
 
     IOHIDEventRef ev = IOHIDEventCreateDigitizerFingerEvent(
         kCFAllocatorDefault, mach_absolute_time(),
         /*index*/ 1, /*identity*/ 2,
-        (kHIDDigitizerRange | kHIDDigitizerTouch), /*buttonMask*/ 0,
-        nx, ny, /*z*/ 0.0f, /*tipPressure*/ touching ? 1.0f : 0.0f, /*twist*/ 0.0f,
+        (kHIDDigitizerRange | kHIDDigitizerTouch),
+        nx, ny, /*z*/ 0.0, /*tipPressure*/ touching ? 1.0 : 0.0, /*twist*/ 0.0,
         /*range*/ touching ? 1 : 0, /*touch*/ touching ? 1 : 0, /*options*/ 0);
     if (!ev) return;
     IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
+    g_hid_dispatch_count++;
     CFRelease(ev);
 }
 

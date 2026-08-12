@@ -2168,8 +2168,22 @@ static void setup_overlay() {
     // Main-thread pump: ALL il2cpp/game reads happen here, never on the render
     // thread. Matched to the render thread's 60fps so boxes update every
     // drawn frame instead of visibly lagging behind at half rate.
-    [NSTimer scheduledTimerWithTimeInterval:1.0/60.0 repeats:YES
-                                      block:^(NSTimer* t) { main_pump(); }];
+    //
+    // MUST be added via NSRunLoopCommonModes, NOT scheduledTimerWithTimeInterval:
+    // (which only registers in NSDefaultRunLoopMode). While the player is
+    // actively touching the screen — dragging to look around, moving,
+    // shooting, basically all of normal gameplay — the main run loop switches
+    // to UITrackingRunLoopMode for smooth touch tracking, and a Default-mode-
+    // only timer simply does not fire during that. That's why resolve/boxes/
+    // triggerbot all looked like they "only worked while the menu was open":
+    // opening the menu is the one time the player ISN'T continuously
+    // dragging, so the run loop drops back to Default mode and the timer
+    // resumes. Registering the timer in Common modes makes it fire in BOTH.
+    {
+        NSTimer* pumpTimer = [NSTimer timerWithTimeInterval:1.0/60.0 repeats:YES
+                                                       block:^(NSTimer* t) { main_pump(); }];
+        [[NSRunLoop mainRunLoop] addTimer:pumpTimer forMode:NSRunLoopCommonModes];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2185,11 +2199,16 @@ static void setup_overlay() {
                    dispatch_get_main_queue(), ^{
         bind_pointers();
         setup_overlay();
+        // Same UITrackingRunLoopMode issue as the main pump timer above —
+        // scheduledTimerWithTimeInterval: alone would silently stop retrying
+        // resolve the moment the player starts actually playing (dragging to
+        // look around). Common modes so it keeps retrying during real gameplay.
         __block NSTimer* retryTimer = nil;
-        retryTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer* t) {
+        retryTimer = [NSTimer timerWithTimeInterval:2.0 repeats:YES block:^(NSTimer* t) {
             if (g_resolved) { [t invalidate]; return; }
             g_want_resolve = true;
         }];
+        [[NSRunLoop mainRunLoop] addTimer:retryTimer forMode:NSRunLoopCommonModes];
         (void)retryTimer;
     });
 }

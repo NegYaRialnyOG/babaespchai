@@ -1625,6 +1625,23 @@ static void render_frame(float screenW, float screenH) {
                 if (cfgList.empty()) ImGui::TextDisabled("(none yet)");
                 ImGui::EndTabItem();
             }
+
+            if (ImGui::BeginTabItem("Inject")) {
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                    "Press this ONLY while you are actually IN A MATCH");
+                ImGui::TextDisabled("(not the menu/lobby — player and camera objects\ndon't exist yet outside a live match, so resolving\nthere can never succeed no matter how many times\nit retries)");
+                ImGui::Spacing();
+                if (ImGui::Button("Inject / Resolve now", ImVec2(-1, 0))) {
+                    g_want_resolve = true;
+                }
+                ImGui::Spacing();
+                if (g_resolved) {
+                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Resolved — players seen: %d", g_plh_count);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Not resolved yet");
+                }
+                ImGui::EndTabItem();
+            }
             ImGui::EndTabBar();
         }
     }

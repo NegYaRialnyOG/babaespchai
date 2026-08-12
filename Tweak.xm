@@ -1081,32 +1081,12 @@ static void compute_boxes() {
 // Quaternion layout matches Unity's own (x,y,z,w), 16 bytes — standard, not
 // build-specific.
 
-// Unity's exact Quaternion.Euler formula (pitch=x, yaw=y, roll=z, degrees),
-// lifted directly from a working reference implementation for this game.
-// NOTE: kept for reference but NO LONGER USED by apply_aimbot (see
-// quat_look_rotation below) — user-reported symptom was "aim tracks the
-// target's movement correctly but points in a completely different
-// direction", i.e. right RELATIVE dynamics, wrong ABSOLUTE orientation.
-// That's the exact signature of an Euler axis-order/sign mistake: the
-// pitch/yaw NUMBERS can be computed correctly from geometry and still come
-// out of Quaternion.Euler() pointing the wrong way if this formula's axis
-// convention doesn't match the game's. Left in place only in case a future
-// diagnostic session needs to A/B it against the new approach.
-static Quat euler_to_quat_unity(float pitchDeg, float yawDeg, float rollDeg) {
-    const float d2r = (float)M_PI / 180.0f;
-    float cx = cosf(pitchDeg * d2r * 0.5f), sx = sinf(pitchDeg * d2r * 0.5f);
-    float cy = cosf(yawDeg   * d2r * 0.5f), sy = sinf(yawDeg   * d2r * 0.5f);
-    float cz = cosf(rollDeg  * d2r * 0.5f), sz = sinf(rollDeg  * d2r * 0.5f);
-    Quat q;
-    q.x = cx*sy*sz + cy*cz*sx;
-    q.y = cx*cz*sy - cy*sx*sz;
-    q.z = cx*cy*sz - cz*sx*sy;
-    q.w = sx*sy*sz + cx*cy*cz;
-    return q;
-}
-
-// Robust replacement for the euler_to_quat_unity path above: builds the
-// "look at target" quaternion DIRECTLY from the eye->target direction via a
+// Replaces a prior Euler-angle (pitch/yaw/roll -> Quaternion.Euler) approach
+// that was removed after it turned out to point aim in a consistently wrong
+// absolute direction while still tracking target movement correctly — the
+// exact signature of an Euler axis-order/sign mistake (see git history for
+// the old euler_to_quat_unity if a future session needs to A/B it again).
+// Builds the "look at target" quaternion DIRECTLY from the eye->target direction via a
 // right/up/forward basis + matrix->quaternion conversion (Shepperd's
 // method), instead of going through pitch/yaw/roll Euler angles at all.
 // This sidesteps Euler axis-order/sign pitfalls entirely — there is no

@@ -213,6 +213,34 @@ static uintptr_t g_ecc_camrot_off = 0x8;  // PlayerCharacterInputs.m_qCameraRota
 static char      g_ecc_ns[64]    = "KinematicCharacterController.Examples";
 static char      g_ecc_cls[64]   = "ExampleCharacterController";
 static void*     g_ecc_type_obj  = NULL;   // cached System.Type for the above
+
+// --- Shooter probe (temporary, read-only) ------------------------------
+// Investigating whether the real local "fire" state can be read/written
+// directly via il2cpp instead of relying on synthetic touch injection (HID
+// taps confirmed dispatching but not registering in-game after two targeted
+// fixes — switching technique again blind would repeat the same guessing
+// mistake as the old send_pos dead end). "Shooter" (empty namespace,
+// TypeDefIndex 113 in dump.cs) sits in the same low-TypeDefIndex cluster as
+// PLH itself and has a static singleton pattern, unlike the "Gun"/"Player"
+// classes elsewhere in the dump which are almost certainly unused demo/
+// asset-pack leftovers (clean unobfuscated names AND fields, unlike
+// Shooter's near-total obfuscation, which matches PLH's own — a sign of
+// real, actively-used game code). Reading its instance bools passively
+// (never writing) while the user manually fires should reveal which one is
+// the real firing flag, instead of guessing which offset to write blind.
+static void*     g_shooter_klass        = NULL;
+static void*     g_shooter_singleton_fld = NULL;
+// Candidate instance bool offsets on the live Shooter singleton — every
+// bool field found on the class that isn't obviously something else
+// (colors/counters/etc). [HideInInspector] on 0x309 makes it the top
+// suspect (set by code at runtime, not a designer toggle) but all are
+// watched since guessing which one matters defeats the point of measuring.
+static const uintptr_t kShooterBoolOffsets[] = {
+    0x140, 0x148, 0x150, 0x151, 0x170, 0x1FC, 0x1FD,
+    0x2A8, 0x2A9, 0x2D8, 0x308, 0x309, 0x30A, 0x30B, 0x320, 0x348
+};
+static const int kShooterBoolCount = 16;
+static char g_shooter_probe_text[256] = "shooter: not resolved";
 static bool      g_aimbot_on         = false;
 // Assist mode: blend from the REAL current view (whatever the player's own
 // manual input already set this tick) toward the target, instead of from
@@ -679,7 +707,40 @@ static void resolve_all() {
 
     write_step(15); g_type_obj = g_img ? type_object_for(g_target_ns, g_target_cls) : NULL;
     write_step(16); g_ecc_type_obj = g_img ? type_object_for(g_ecc_ns, g_ecc_cls) : NULL;
-    write_step(17); g_dom = NULL; g_resolved = true;
+
+    write_step(17);
+    g_shooter_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", "Shooter") : NULL;
+    g_shooter_singleton_fld = (g_shooter_klass && il2cpp_class_get_field_from_name)
+        ? il2cpp_class_get_field_from_name(g_shooter_klass, "FIEHLIHPAJF") : NULL;
+
+    write_step(18); g_dom = NULL; g_resolved = true;
+}
+
+// Read-only probe: pulls the live Shooter singleton instance and dumps its
+// candidate bool fields into a human-readable line. Called every main-pump
+// tick so the on-screen text always reflects the current frame. NEVER
+// writes anything — purely observational until we know which offset is
+// the real firing flag.
+static void probe_shooter_bools() {
+    if (!g_shooter_singleton_fld || !il2cpp_field_static_get_value) {
+        snprintf(g_shooter_probe_text, sizeof(g_shooter_probe_text), "shooter: not resolved");
+        return;
+    }
+    void* inst = NULL;
+    il2cpp_field_static_get_value(g_shooter_singleton_fld, &inst);
+    if (!safe_ptr(inst)) {
+        snprintf(g_shooter_probe_text, sizeof(g_shooter_probe_text), "shooter: singleton null");
+        return;
+    }
+    char buf[256]; int off = 0;
+    off += snprintf(buf + off, sizeof(buf) - off, "sh");
+    for (int i = 0; i < kShooterBoolCount && off < (int)sizeof(buf) - 8; i++) {
+        uintptr_t o = kShooterBoolOffsets[i];
+        bool v = *(bool*)((char*)inst + o);
+        off += snprintf(buf + off, sizeof(buf) - off, " %x:%d", (unsigned)o, v ? 1 : 0);
+    }
+    strncpy(g_shooter_probe_text, buf, sizeof(g_shooter_probe_text) - 1);
+    g_shooter_probe_text[sizeof(g_shooter_probe_text) - 1] = 0;
 }
 
 // Read the PLH static player array and collect element pointers (valid this
@@ -1445,6 +1506,7 @@ static void main_pump() {
     // in resolve_all), not here — see apply_aimbot's comment for why a plain
     // periodic write from this timer never survived to be used.
     maybe_triggerbot(); // main-thread only (UIKit touch injection) — this timer already runs on the main thread
+    if (g_resolved) probe_shooter_bools(); // read-only Shooter field probe, see its own comment
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,6 +1928,14 @@ static void render_frame(float screenW, float screenH) {
                      g_aimbot_wallcheck ? 1 : 0, g_hid_client_ok ? 1 : 0, g_hid_dispatch_count, g_trigger_fire_count,
                      g_hid_last_tap_x, g_hid_last_tap_y);
             draw_outlined_text(dl, ImVec2(10, y), IM_COL32(255,220,120,255), buf);
+            y += 18.0f;
+        }
+        // Read-only Shooter field probe (see probe_shooter_bools) — always
+        // visible once resolved, no toggle needed, temporary until we know
+        // which offset is the real firing flag. Fire a few shots manually
+        // and screenshot; whichever offset flips 0->1 in sync is the answer.
+        if (g_resolved) {
+            draw_outlined_text(dl, ImVec2(10, y), IM_COL32(150,255,220,255), g_shooter_probe_text);
         }
     }
 

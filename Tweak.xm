@@ -241,6 +241,46 @@ static const uintptr_t kShooterBoolOffsets[] = {
 };
 static const int kShooterBoolCount = 16;
 static char g_shooter_probe_text[256] = "shooter: not resolved";
+
+// --- Shooter fire-method candidates (real fix attempt, not another HID tweak) ---
+// Found via the Android reference source (alais.tech, different codebase,
+// same game): Shooter.BulletHitScan2() is the ACTUAL shot hit-detection
+// method — its hook there does `Old_BulletHitScan2(this); return true;`,
+// i.e. call through then force a hit, confirming this is the real
+// "process the shot" method, called as part of the normal fire flow (not a
+// per-frame poll). Two sibling hooks, CheckPlayerCollider/CheckPlayerCollider_2
+// (also bool(void), forced to `return false`), are auxiliary collision
+// checks used during that same shot, not the fire method itself.
+//
+// Field-count corroboration on OUR OWN iOS dump: Shooter has exactly THREE
+// RaycastHit fields (0x35C, 0x39C, 0x3D8) — consistent with three distinct
+// raycast-based checks (main hitscan + 2 collider checks), matching these
+// three hooked methods structurally.
+//
+// The Android build obfuscates method names differently than iOS (barely
+// at all vs heavily), so the RVA doesn't transfer — but the SIGNATURE does:
+// bool method(void* __this), zero explicit args. Every method on our iOS
+// Shooter matching that exact signature, in declaration order:
+static const uintptr_t kShooterBoolMethodRVAs[] = {
+    0x2F0ACF8,  // JLPGAJLEECJ
+    0x2F0F58C,  // MCFEHPODEMJ
+    0x2F0A8B0,  // CJNNGHIBLLK
+    0x2F0F71C,  // EEIJNECHIDO
+    0x2F18000,  // INHHFJEFNAO
+};
+static const char* kShooterBoolMethodNames[] = {
+    "JLPGAJLEECJ", "MCFEHPODEMJ", "CJNNGHIBLLK", "EEIJNECHIDO", "INHHFJEFNAO"
+};
+static const int kShooterBoolMethodCount = 5;
+// No positional/call-graph proof of which of these 5 is BulletHitScan2 (no
+// full Android dump to cross-reference order against) — rather than guess,
+// each gets a manual "Test N" button that calls it ONCE on button press
+// against the live Shooter singleton, so it can be confirmed empirically by
+// whether a real shot actually fires, exactly the acceptance test that
+// matters, instead of another blind write.
+typedef bool (*ShooterBoolMethod_t)(void*, void*);
+static ShooterBoolMethod_t g_shooterBoolMethods[5] = { NULL, NULL, NULL, NULL, NULL };
+static char g_shooter_test_result[128] = "";
 static bool      g_aimbot_on         = false;
 // Assist mode: blend from the REAL current view (whatever the player's own
 // manual input already set this tick) toward the target, instead of from
@@ -481,6 +521,10 @@ static void bind_pointers() {
     il2cpp_thread_current       = (il2cpp_thread_current_t)      (B + RVA_il2cpp_thread_current);
     il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t)(B + RVA_il2cpp_class_get_field_from_name);
     il2cpp_field_static_get_value    = (il2cpp_field_static_get_value_t)   (B + RVA_il2cpp_field_static_get_value);
+
+    for (int i = 0; i < kShooterBoolMethodCount; i++) {
+        g_shooterBoolMethods[i] = (ShooterBoolMethod_t)(B + kShooterBoolMethodRVAs[i]);
+    }
 }
 
 // Ensure the CURRENT thread (MTKView render thread) is attached to the il2cpp
@@ -741,6 +785,33 @@ static void probe_shooter_bools() {
     }
     strncpy(g_shooter_probe_text, buf, sizeof(g_shooter_probe_text) - 1);
     g_shooter_probe_text[sizeof(g_shooter_probe_text) - 1] = 0;
+}
+
+// Set by a menu button (render thread) to 0..4 to request candidate i be
+// called once; consumed on the main thread by main_pump — same "want" flag
+// pattern as g_want_resolve, since il2cpp calls must never happen from the
+// render thread (established the hard way earlier in this project).
+static int g_want_test_shooter_idx = -1;
+
+// Calls ONE candidate Shooter bool-method once against the live singleton
+// and records what happened. This is the actual fire attempt now — if the
+// right candidate is hit, this alone fires a real shot, no touch/HID
+// involved at all.
+static void test_shooter_method(int idx) {
+    if (idx < 0 || idx >= kShooterBoolMethodCount) return;
+    if (!g_shooter_singleton_fld || !il2cpp_field_static_get_value || !g_shooterBoolMethods[idx]) {
+        snprintf(g_shooter_test_result, sizeof(g_shooter_test_result), "not resolved");
+        return;
+    }
+    void* inst = NULL;
+    il2cpp_field_static_get_value(g_shooter_singleton_fld, &inst);
+    if (!safe_ptr(inst)) {
+        snprintf(g_shooter_test_result, sizeof(g_shooter_test_result), "singleton null");
+        return;
+    }
+    bool ret = g_shooterBoolMethods[idx](inst, NULL);
+    snprintf(g_shooter_test_result, sizeof(g_shooter_test_result), "called %s -> %d",
+             kShooterBoolMethodNames[idx], ret ? 1 : 0);
 }
 
 // Read the PLH static player array and collect element pointers (valid this
@@ -1507,6 +1578,11 @@ static void main_pump() {
     // periodic write from this timer never survived to be used.
     maybe_triggerbot(); // main-thread only (UIKit touch injection) — this timer already runs on the main thread
     if (g_resolved) probe_shooter_bools(); // read-only Shooter field probe, see its own comment
+    if (g_want_test_shooter_idx >= 0) {
+        int idx = g_want_test_shooter_idx;
+        g_want_test_shooter_idx = -1;
+        test_shooter_method(idx);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1710,6 +1786,15 @@ static void render_frame(float screenW, float screenH) {
                 ImGui::SliderFloat("Rapid (s between shots)", &g_trigger_rapid_s, 0.03f, 1.0f);
                 ImGui::Text("pending=%d  fired=%ld", g_trigger_pending ? 1 : 0, g_trigger_fire_count);
                 if (g_trigger_on) ImGui::TextDisabled("Drag the red marker on screen onto the fire button/zone.");
+
+                ImGui::SeparatorText("Shot method test (temporary)");
+                ImGui::TextDisabled("Aim at an enemy, tap a button, see if a real shot fires.");
+                for (int i = 0; i < kShooterBoolMethodCount; i++) {
+                    if (i > 0) ImGui::SameLine();
+                    char label[16]; snprintf(label, sizeof(label), "Test %d", i + 1);
+                    if (ImGui::Button(label)) g_want_test_shooter_idx = i;
+                }
+                if (g_shooter_test_result[0]) ImGui::TextDisabled("%s", g_shooter_test_result);
                 ImGui::EndTabItem();
             }
 

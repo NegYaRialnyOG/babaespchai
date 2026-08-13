@@ -68,6 +68,7 @@ typedef void* (*il2cpp_thread_attach_t)(void*);   // attach current thread to a 
 typedef void* (*il2cpp_thread_current_t)();        // NULL if thread not attached
 typedef void* (*il2cpp_class_get_field_from_name_t)(void*, const char*);
 typedef void  (*il2cpp_field_static_get_value_t)(void*, void*);
+typedef void  (*il2cpp_field_static_set_value_t)(void*, void*);
 
 static il2cpp_domain_get_t           il2cpp_domain_get           = NULL;
 static il2cpp_domain_assembly_open_t il2cpp_domain_assembly_open = NULL;
@@ -81,6 +82,7 @@ static il2cpp_thread_attach_t        il2cpp_thread_attach        = NULL;
 static il2cpp_thread_current_t       il2cpp_thread_current       = NULL;
 static il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name = NULL;
 static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value    = NULL;
+static il2cpp_field_static_set_value_t    il2cpp_field_static_set_value    = NULL;
 
 // RVAs (UnityFramework, build 260720) --------------------------------------
 // Re-derived after the game updated past 260206 (which caused the domain_get
@@ -109,6 +111,7 @@ static il2cpp_field_static_get_value_t    il2cpp_field_static_get_value    = NUL
 #define RVA_il2cpp_thread_current        0x2579cac
 #define RVA_il2cpp_class_get_field_from_name 0x2579330
 #define RVA_il2cpp_field_static_get_value    0x2579a2c
+#define RVA_il2cpp_field_static_set_value    0x2579a30   // verified against UnityFramework Mach-O symbol table, adjacent to the getter
 
 // Live-tunable target -------------------------------------------------------
 static char      g_image_name[64] = "UnityFramework";
@@ -230,6 +233,10 @@ static void*     g_ecc_type_obj  = NULL;   // cached System.Type for the above
 // the real firing flag, instead of guessing which offset to write blind.
 static void*     g_shooter_klass        = NULL;
 static void*     g_shooter_singleton_fld = NULL;
+// ControllTouch.inAttackKey — the real fire-input flag, see set_attack_key's
+// own comment (near maybe_triggerbot) for the full story of how this was found.
+static void*     g_controltouch_klass    = NULL;
+static void*     g_inattackkey_fld       = NULL;
 // Candidate instance bool offsets on the live Shooter singleton — every
 // bool field found on the class that isn't obviously something else
 // (colors/counters/etc). [HideInInspector] on 0x309 makes it the top
@@ -242,45 +249,14 @@ static const uintptr_t kShooterBoolOffsets[] = {
 static const int kShooterBoolCount = 16;
 static char g_shooter_probe_text[256] = "shooter: not resolved";
 
-// --- Shooter fire-method candidates (real fix attempt, not another HID tweak) ---
-// Found via the Android reference source (alais.tech, different codebase,
-// same game): Shooter.BulletHitScan2() is the ACTUAL shot hit-detection
-// method — its hook there does `Old_BulletHitScan2(this); return true;`,
-// i.e. call through then force a hit, confirming this is the real
-// "process the shot" method, called as part of the normal fire flow (not a
-// per-frame poll). Two sibling hooks, CheckPlayerCollider/CheckPlayerCollider_2
-// (also bool(void), forced to `return false`), are auxiliary collision
-// checks used during that same shot, not the fire method itself.
-//
-// Field-count corroboration on OUR OWN iOS dump: Shooter has exactly THREE
-// RaycastHit fields (0x35C, 0x39C, 0x3D8) — consistent with three distinct
-// raycast-based checks (main hitscan + 2 collider checks), matching these
-// three hooked methods structurally.
-//
-// The Android build obfuscates method names differently than iOS (barely
-// at all vs heavily), so the RVA doesn't transfer — but the SIGNATURE does:
-// bool method(void* __this), zero explicit args. Every method on our iOS
-// Shooter matching that exact signature, in declaration order:
-static const uintptr_t kShooterBoolMethodRVAs[] = {
-    0x2F0ACF8,  // JLPGAJLEECJ
-    0x2F0F58C,  // MCFEHPODEMJ
-    0x2F0A8B0,  // CJNNGHIBLLK
-    0x2F0F71C,  // EEIJNECHIDO
-    0x2F18000,  // INHHFJEFNAO
-};
-static const char* kShooterBoolMethodNames[] = {
-    "JLPGAJLEECJ", "MCFEHPODEMJ", "CJNNGHIBLLK", "EEIJNECHIDO", "INHHFJEFNAO"
-};
-static const int kShooterBoolMethodCount = 5;
-// No positional/call-graph proof of which of these 5 is BulletHitScan2 (no
-// full Android dump to cross-reference order against) — rather than guess,
-// each gets a manual "Test N" button that calls it ONCE on button press
-// against the live Shooter singleton, so it can be confirmed empirically by
-// whether a real shot actually fires, exactly the acceptance test that
-// matters, instead of another blind write.
-typedef bool (*ShooterBoolMethod_t)(void*, void*);
-static ShooterBoolMethod_t g_shooterBoolMethods[5] = { NULL, NULL, NULL, NULL, NULL };
-static char g_shooter_test_result[128] = "";
+// Note: an earlier attempt here tried calling Shooter's raw hit-detection
+// method directly by RVA (5 candidates found via structural signature
+// matching against an Android reference of this game — bool method(void),
+// zero args). 2 of 5 crashed, none fired a shot: that method turned out to
+// be a low-level piece of a larger fire sequence, not safe/meaningful to
+// invoke standalone out of context. Removed — see set_attack_key below for
+// what actually works (ControllTouch.inAttackKey), found from the SAME
+// Android reference's own Auto Shoot feature.
 static bool      g_aimbot_on         = false;
 // Assist mode: blend from the REAL current view (whatever the player's own
 // manual input already set this tick) toward the target, instead of from
@@ -353,14 +329,11 @@ static bool      g_trigger_pending         = false;
 static double    g_trigger_pending_until   = 0.0;
 static double    g_trigger_last_fire_time  = 0.0;
 static long      g_trigger_fire_count      = 0;
-static float     g_trigger_tap_x           = -1.0f, g_trigger_tap_y = -1.0f; // draggable marker; -1 = not yet placed (defaults to screen center once known)
-// Diagnostic-only (temporary): declared up here (not next to g_hidClient
-// below, where they're actually written) so render_frame — which comes
-// BEFORE the IOHID section in this file — can read them for the on-screen
-// trigger debug line. Remove alongside that debug line once confirmed.
-static long      g_hid_dispatch_count      = 0;
-static bool      g_hid_client_ok           = false;
-static float     g_hid_last_tap_x          = -1.0f, g_hid_last_tap_y = -1.0f;
+// Diagnostic-only (temporary): declared up here so render_frame — which
+// comes BEFORE the resolve/fire section in this file — can read them for
+// the on-screen trigger debug line.
+static long      g_attackkey_set_count     = 0;
+static bool      g_attackkey_resolved      = false;
 // Persistent aim-turn state, updated ourselves frame-to-frame instead of
 // re-reading the inputs struct's "cur" field as the slerp start point. The
 // struct's field turned out to reflect the game's own (untouched, since the
@@ -521,10 +494,7 @@ static void bind_pointers() {
     il2cpp_thread_current       = (il2cpp_thread_current_t)      (B + RVA_il2cpp_thread_current);
     il2cpp_class_get_field_from_name = (il2cpp_class_get_field_from_name_t)(B + RVA_il2cpp_class_get_field_from_name);
     il2cpp_field_static_get_value    = (il2cpp_field_static_get_value_t)   (B + RVA_il2cpp_field_static_get_value);
-
-    for (int i = 0; i < kShooterBoolMethodCount; i++) {
-        g_shooterBoolMethods[i] = (ShooterBoolMethod_t)(B + kShooterBoolMethodRVAs[i]);
-    }
+    il2cpp_field_static_set_value    = (il2cpp_field_static_set_value_t)   (B + RVA_il2cpp_field_static_set_value);
 }
 
 // Ensure the CURRENT thread (MTKView render thread) is attached to the il2cpp
@@ -757,7 +727,12 @@ static void resolve_all() {
     g_shooter_singleton_fld = (g_shooter_klass && il2cpp_class_get_field_from_name)
         ? il2cpp_class_get_field_from_name(g_shooter_klass, "FIEHLIHPAJF") : NULL;
 
-    write_step(18); g_dom = NULL; g_resolved = true;
+    write_step(18);
+    g_controltouch_klass = (g_img && il2cpp_class_from_name) ? il2cpp_class_from_name(g_img, "", "ControllTouch") : NULL;
+    g_inattackkey_fld = (g_controltouch_klass && il2cpp_class_get_field_from_name)
+        ? il2cpp_class_get_field_from_name(g_controltouch_klass, "inAttackKey") : NULL;
+
+    write_step(19); g_dom = NULL; g_resolved = true;
 }
 
 // Read-only probe: pulls the live Shooter singleton instance and dumps its
@@ -785,33 +760,6 @@ static void probe_shooter_bools() {
     }
     strncpy(g_shooter_probe_text, buf, sizeof(g_shooter_probe_text) - 1);
     g_shooter_probe_text[sizeof(g_shooter_probe_text) - 1] = 0;
-}
-
-// Set by a menu button (render thread) to 0..4 to request candidate i be
-// called once; consumed on the main thread by main_pump — same "want" flag
-// pattern as g_want_resolve, since il2cpp calls must never happen from the
-// render thread (established the hard way earlier in this project).
-static int g_want_test_shooter_idx = -1;
-
-// Calls ONE candidate Shooter bool-method once against the live singleton
-// and records what happened. This is the actual fire attempt now — if the
-// right candidate is hit, this alone fires a real shot, no touch/HID
-// involved at all.
-static void test_shooter_method(int idx) {
-    if (idx < 0 || idx >= kShooterBoolMethodCount) return;
-    if (!g_shooter_singleton_fld || !il2cpp_field_static_get_value || !g_shooterBoolMethods[idx]) {
-        snprintf(g_shooter_test_result, sizeof(g_shooter_test_result), "not resolved");
-        return;
-    }
-    void* inst = NULL;
-    il2cpp_field_static_get_value(g_shooter_singleton_fld, &inst);
-    if (!safe_ptr(inst)) {
-        snprintf(g_shooter_test_result, sizeof(g_shooter_test_result), "singleton null");
-        return;
-    }
-    bool ret = g_shooterBoolMethods[idx](inst, NULL);
-    snprintf(g_shooter_test_result, sizeof(g_shooter_test_result), "called %s -> %d",
-             kShooterBoolMethodNames[idx], ret ? 1 : 0);
 }
 
 // Read the PLH static player array and collect element pointers (valid this
@@ -1576,13 +1524,8 @@ static void main_pump() {
     // Aimbot itself now runs from inside the SetInputs hook (installed once
     // in resolve_all), not here — see apply_aimbot's comment for why a plain
     // periodic write from this timer never survived to be used.
-    maybe_triggerbot(); // main-thread only (UIKit touch injection) — this timer already runs on the main thread
+    maybe_triggerbot(); // fires via ControllTouch.inAttackKey now, see pulse_attack_key
     if (g_resolved) probe_shooter_bools(); // read-only Shooter field probe, see its own comment
-    if (g_want_test_shooter_idx >= 0) {
-        int idx = g_want_test_shooter_idx;
-        g_want_test_shooter_idx = -1;
-        test_shooter_method(idx);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1654,8 +1597,6 @@ static bool save_config(const std::string& name) {
     f << "trigger_reaction_min_ms=" << g_trigger_reaction_min_ms << "\n";
     f << "trigger_reaction_max_ms=" << g_trigger_reaction_max_ms << "\n";
     f << "trigger_rapid_s=" << g_trigger_rapid_s << "\n";
-    f << "trigger_tap_x=" << g_trigger_tap_x << "\n";
-    f << "trigger_tap_y=" << g_trigger_tap_y << "\n";
     return true;
 }
 
@@ -1694,8 +1635,6 @@ static bool load_config(const std::string& name) {
         else if (key=="trigger_reaction_min_ms") g_trigger_reaction_min_ms = (float)atof(val.c_str());
         else if (key=="trigger_reaction_max_ms") g_trigger_reaction_max_ms = (float)atof(val.c_str());
         else if (key=="trigger_rapid_s") g_trigger_rapid_s = (float)atof(val.c_str());
-        else if (key=="trigger_tap_x") g_trigger_tap_x = (float)atof(val.c_str());
-        else if (key=="trigger_tap_y") g_trigger_tap_y = (float)atof(val.c_str());
     }
     return true;
 }
@@ -1785,16 +1724,7 @@ static void render_frame(float screenW, float screenH) {
                 ImGui::SameLine(); ImGui::TextDisabled("(both 0 = instant, no recheck)");
                 ImGui::SliderFloat("Rapid (s between shots)", &g_trigger_rapid_s, 0.03f, 1.0f);
                 ImGui::Text("pending=%d  fired=%ld", g_trigger_pending ? 1 : 0, g_trigger_fire_count);
-                if (g_trigger_on) ImGui::TextDisabled("Drag the red marker on screen onto the fire button/zone.");
-
-                ImGui::SeparatorText("Shot method test (temporary)");
-                ImGui::TextDisabled("Aim at an enemy, tap a button, see if a real shot fires.");
-                for (int i = 0; i < kShooterBoolMethodCount; i++) {
-                    if (i > 0) ImGui::SameLine();
-                    char label[16]; snprintf(label, sizeof(label), "Test %d", i + 1);
-                    if (ImGui::Button(label)) g_want_test_shooter_idx = i;
-                }
-                if (g_shooter_test_result[0]) ImGui::TextDisabled("%s", g_shooter_test_result);
+                if (g_trigger_on) ImGui::TextDisabled("Fires via ControllTouch.inAttackKey directly, no tap simulation.");
                 ImGui::EndTabItem();
             }
 
@@ -1882,35 +1812,6 @@ static void render_frame(float screenW, float screenH) {
     // Publish display size for the main-thread pump, then DRAW cached boxes.
     // No il2cpp/game reads happen on this (render) thread anymore.
     g_scrW = screenW; g_scrH = screenH;
-    if (g_trigger_tap_x < 0.0f && g_scrW > 0) { g_trigger_tap_x = g_scrW * 0.5f; g_trigger_tap_y = g_scrH * 0.5f; }
-
-    // Draggable triggerbot tap-point marker — only shown while the settings
-    // menu itself is open (calibrate it, close the menu, marker goes away).
-    if (g_menu_open && g_trigger_on && g_scrW > 0 && g_scrH > 0) {
-        ImGui::SetNextWindowPos(ImVec2(g_trigger_tap_x - 22, g_trigger_tap_y - 22), ImGuiCond_Once);
-        ImGui::SetNextWindowSize(ImVec2(44, 44), ImGuiCond_Always);
-        ImGui::Begin("##triggerpoint", nullptr,
-                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar |
-                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
-        {
-            ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-            rects.push_back(CGRectMake(wp.x, wp.y, ws.x, ws.y));
-            if (ImGui::IsWindowHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-                ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
-                ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
-                wp.x += dd.x; wp.y += dd.y;
-                ImGui::SetWindowPos(wp);
-            }
-            g_trigger_tap_x = wp.x + ws.x * 0.5f;
-            g_trigger_tap_y = wp.y + ws.y * 0.5f;
-            ImDrawList* dlm = ImGui::GetWindowDrawList();
-            ImVec2 c(wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f);
-            dlm->AddCircle(c, 18.0f, IM_COL32(255, 60, 60, 255), 24, 3.0f);
-            dlm->AddLine(ImVec2(c.x - 24, c.y), ImVec2(c.x + 24, c.y), IM_COL32(255, 60, 60, 200), 2.0f);
-            dlm->AddLine(ImVec2(c.x, c.y - 24), ImVec2(c.x, c.y + 24), IM_COL32(255, 60, 60, 200), 2.0f);
-        }
-        ImGui::End();
-    }
     {
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         std::lock_guard<std::mutex> l(g_boxes_mtx);
@@ -2009,9 +1910,8 @@ static void render_frame(float screenW, float screenH) {
         }
         if (g_trigger_on) {
             char buf[180];
-            snprintf(buf, sizeof(buf), "trigger wallcheck=%d hid_ok=%d dispatched=%ld fired=%ld tap=(%.0f,%.0f)",
-                     g_aimbot_wallcheck ? 1 : 0, g_hid_client_ok ? 1 : 0, g_hid_dispatch_count, g_trigger_fire_count,
-                     g_hid_last_tap_x, g_hid_last_tap_y);
+            snprintf(buf, sizeof(buf), "trigger wallcheck=%d attackkey_ok=%d sets=%ld fired=%ld",
+                     g_aimbot_wallcheck ? 1 : 0, g_attackkey_resolved ? 1 : 0, g_attackkey_set_count, g_trigger_fire_count);
             draw_outlined_text(dl, ImVec2(10, y), IM_COL32(255,220,120,255), buf);
             y += 18.0f;
         }
@@ -2175,126 +2075,52 @@ static UIView* find_game_root_view() {
 }
 
 // ---------------------------------------------------------------------------
-// Auto Shoot: fires by simulating a real tap, NOT by calling any native fire
-// function directly. The actual fire RPC (Client::send_attackv2) has the
-// SAME kind of ambiguity send_pos had — 0 explicit C# params, dozens of
-// same-shaped candidates in Client alone — too risky to call blind. So
-// instead this synthesizes the input a real player gives to shoot: a tap.
+// Auto Shoot: three earlier attempts all failed —
+//   1. UITouch via private KVC + touchesBegan: on the game's root UIView —
+//      never fires, Unity doesn't read the standard UIResponder chain.
+//   2. IOHIDEventSystemClient synthetic touch, fixed twice (ABI mismatch,
+//      missing SetSenderID) — both were real, confirmed bugs, but the
+//      technique itself STILL never registered as a touch in-game after
+//      both fixes. Simulating a finger and hoping the OS/app touch pipeline
+//      accepts it from an ordinary app process turned out to be exactly the
+//      kind of thing that can't be verified without a device, unlike an
+//      offset check against the dump.
+//   3. Calling Shooter's raw hit-detection method directly by RVA
+//      (candidates found via structural signature matching against an
+//      Android reference of this game) — didn't crash on 3/5, crashed on
+//      2/5, fired nothing: turned out BulletHitScan2-equivalent is a
+//      low-level piece of a larger fire sequence, not something meaningful
+//      to invoke standalone out of context.
 //
-// FIRST attempt at that (kept only in git history now) built a UITouch via
-// private KVC keys and called touchesBegan: directly on the game's root
-// UIView. That never fires here: Unity doesn't listen on the standard
-// UIResponder chain of an arbitrary UIView, it reads touches off its own
-// input surface, so a hand-built UITouch injected via touchesBegan: on the
-// wrong view is simply never seen by the game at all.
-//
-// This version instead injects at the IOHID layer — the same layer the
-// digitizer (touchscreen) driver itself posts real finger events on via
-// IOHIDEventSystemClient — so it looks like a real hardware touch to EVERY
-// app, Unity included, no view/responder-chain guessing required. This is
-// the same private-but-long-stable technique used by jailbreak
-// autoclicker/autotap tools for years. The struct/consts aren't in the
-// public SDK headers, but the signatures below have been stable across iOS
-// versions; still genuinely best-effort until confirmed on a real device —
-// if it turns out to need normalized (0..1) coordinates instead of raw
-// points on this iOS version, that's the first thing to try adjusting.
-typedef struct __IOHIDEvent *IOHIDEventRef;
-typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+// The actual answer, found by reading how that SAME Android reference's own
+// "Auto shoot" feature works: it doesn't touch input or call a fire method
+// at all. It writes directly to a static bool field — ControllTouch.
+// inAttackKey — that the game's own touch-handling code reads every frame
+// to decide whether the fire button is currently held. This class survived
+// on our OWN iOS build with the EXACT same unobfuscated name and field
+// (verified in new_dump/dump.cs: `public static bool inAttackKey; // 0xA6`
+// on class ControllTouch, TypeDefIndex 450) — same pattern already proven
+// reliable everywhere else in this file (SetInputs quaternion, PLH player
+// array): write straight into the game's own state instead of faking input
+// at any layer below it. (g_controltouch_klass/g_inattackkey_fld are
+// declared up near g_shooter_klass so resolve_all(), which is far earlier
+// in this file, can resolve them.)
 
-extern "C" {
-IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
-// Real signature per IOHIDEvent.h (IOKit private headers) — verified against
-// the actual header, NOT re-derived from memory. The PREVIOUS declaration
-// here had an extra bogus `uint32_t buttonMask` parameter that does not
-// exist in the real function, and used `float` for x/y/z/tipPressure/twist
-// where the real type (IOHIDFloat) is `double` on 64-bit (which is every
-// iOS device this runs on). Both are ABI-breaking: on arm64 AAPCS64,
-// integer/pointer args and float/double args are allocated into SEPARATE
-// register files (GPRs vs FPRs) independently, in declaration order within
-// each file. The bogus extra GPR-classified `buttonMask` argument shifted
-// every GPR arg after it by one slot — so what we thought was `buttonMask=0`
-// landed in the register the REAL function reads as `range`, meaning the
-// real `range` was ALWAYS 0 regardless of what we intended, and our real
-// `range`/`touch` values landed in the registers the real function reads as
-// `touch`/`options`. A digitizer event with range=false is never treated as
-// an actual finger touching the glass — this alone was enough to make
-// EVERY injected tap a silent no-op, independent of the HID entitlement
-// (which was already correctly present) or marker placement. The
-// float-vs-double mismatch on top of that would have corrupted the
-// coordinate/pressure values too. This is the actual root cause of
-// "выстрел не работает от слова совсем" — confirmed by cross-referencing
-// the real IOHIDEvent.h signature, not guessed.
-IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(CFAllocatorRef allocator,
-                                                    uint64_t timeStamp,
-                                                    uint32_t index,
-                                                    uint32_t identity,
-                                                    uint32_t eventMask,
-                                                    double x, double y, double z,
-                                                    double tipPressure, double twist,
-                                                    int range, int touch,
-                                                    uint32_t options);
-void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
-// Missing piece found by cross-referencing a real working synthetic-touch
-// implementation (iolate/SimulateTouch): a sender ID must be stamped onto
-// the event BEFORE dispatch. Without it, IOHIDEventSystemClientDispatchEvent
-// still succeeds (no crash, no null return, our dispatch counter still
-// increments) but the event apparently never gets attributed to a real
-// digitizer service the app's touch pipeline listens to — dispatch
-// "succeeding" was never proof the app actually received a touch, just proof
-// the call didn't error out. 0xDEFACEDBEEFFECE5 is the sender ID value used
-// by that reference implementation and, per multiple other autotap/autotouch
-// jailbreak tools independently converging on the same constant, appears to
-// be what real digitizer services expect/accept here.
-void IOHIDEventSetSenderID(IOHIDEventRef event, uint64_t senderID);
+static void set_attack_key(bool v) {
+    if (!g_inattackkey_fld || !il2cpp_field_static_set_value) { g_attackkey_resolved = false; return; }
+    g_attackkey_resolved = true;
+    il2cpp_field_static_set_value(g_inattackkey_fld, &v);
 }
 
-// kIOHIDDigitizerEventRange / kIOHIDDigitizerEventTouch — bit 0 / bit 1 of
-// the digitizer eventMask, per the long-standing private IOHIDEventTypes.h.
-enum { kHIDDigitizerRange = 1 << 0, kHIDDigitizerTouch = 1 << 1 };
-
-static IOHIDEventSystemClientRef g_hidClient = NULL;
-// g_hid_dispatch_count / g_hid_client_ok are declared earlier in the file
-// (near g_trigger_fire_count) so render_frame can read them; defined here
-// only in the sense that this is where they get WRITTEN.
-
-static void hid_dispatch_finger(CGPoint pt, bool touching, uint32_t identity) {
-    if (!g_hidClient) g_hidClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-    g_hid_client_ok = (g_hidClient != NULL);
-    if (!g_hidClient) return;
-
-    CGRect bounds = [UIScreen mainScreen].bounds;
-    double nx = (bounds.size.width  > 0) ? (double)(pt.x / bounds.size.width)  : 0.0;
-    double ny = (bounds.size.height > 0) ? (double)(pt.y / bounds.size.height) : 0.0;
-
-    IOHIDEventRef ev = IOHIDEventCreateDigitizerFingerEvent(
-        kCFAllocatorDefault, mach_absolute_time(),
-        /*index*/ 1, identity,
-        (kHIDDigitizerRange | kHIDDigitizerTouch),
-        nx, ny, /*z*/ 0.0, /*tipPressure*/ touching ? 1.0 : 0.0, /*twist*/ 0.0,
-        /*range*/ touching ? 1 : 0, /*touch*/ touching ? 1 : 0, /*options*/ 0);
-    if (!ev) return;
-    IOHIDEventSetSenderID(ev, 0xDEFACEDBEEFFECE5ULL);
-    IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
-    g_hid_dispatch_count++;
-    g_hid_last_tap_x = pt.x; g_hid_last_tap_y = pt.y;
-    CFRelease(ev);
-}
-
-// `identity` is meant to uniquely track ONE continuous physical contact —
-// reusing the same fixed identity (was hardcoded =2) across many rapid
-// separate taps (triggerbot can fire every g_trigger_rapid_s, default
-// 0.15s) risks the digitizer state machine treating a new down as a
-// continuation of a not-yet-fully-released previous touch, especially with
-// only a 50ms gap between our own down/up. A fresh identity per tap avoids
-// that ambiguity — cheap, well-justified regardless of whether it turns out
-// to be the actual reason fires aren't landing.
-static void inject_tap(CGPoint point) {
-    static uint32_t s_next_identity = 100;  // clear of any real-finger identity range
-    uint32_t identity = s_next_identity++;
-    hid_dispatch_finger(point, true, identity);
-    // Release phase a beat later — a brief tap, not a held-down touch.
+// Pulses inAttackKey true then false a beat later, mirroring a real quick
+// tap-and-release on the fire button rather than a held-down key (matches
+// the existing reaction/rapid-fire timing model, which already thinks in
+// terms of discrete shots).
+static void pulse_attack_key() {
+    set_attack_key(true);
+    g_attackkey_set_count++;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        hid_dispatch_finger(point, false, identity);
+        set_attack_key(false);
     });
 }
 
@@ -2385,8 +2211,6 @@ static void maybe_triggerbot() {
     // acquisitions, not just within one hold.
     if (now - g_trigger_last_fire_time < g_trigger_rapid_s) return;
 
-    CGPoint tapPoint = CGPointMake(g_trigger_tap_x, g_trigger_tap_y);
-
     if (!g_trigger_pending) {
         // Just acquired: arm the (possibly randomized) reaction-time wait.
         float minMs = g_trigger_reaction_min_ms;
@@ -2399,7 +2223,7 @@ static void maybe_triggerbot() {
             // "если делай стоит 0 можешь не проверять".
             g_trigger_last_fire_time = now;
             g_trigger_fire_count++;
-            inject_tap(tapPoint);
+            pulse_attack_key();
             return;
         }
         g_trigger_pending = true;
@@ -2416,7 +2240,7 @@ static void maybe_triggerbot() {
         g_trigger_pending = false;
         g_trigger_last_fire_time = now;
         g_trigger_fire_count++;
-        inject_tap(tapPoint);
+        pulse_attack_key();
     }
 }
 

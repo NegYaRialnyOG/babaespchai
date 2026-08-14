@@ -1,42 +1,33 @@
 --[[
     ===================================================================
-    MM2 Clean Standalone Autofarm + Discord Webhooks
-    Based directly on original mm2 autofarm.lua engine
+    MM2 Rage Autofarm (No Evade / Pure Speed Mode)
+    Direct Under-Map Coin Sniping + Discord Webhooks + Instant Void Reset
     100% Compatible with all standard Roblox Executors (Solara, Wave, etc.)
     ===================================================================
 --]]
 
 local Config = {
     WebhookURL = "https://discord.com/api/webhooks/1537506182548295760/lOkkQ7G6mYbL--4LcsiTbYPeuN7oVeJ2c9GS5Wmn54bO-vCjzLaDFDPwEIhOwVRvvenZ",
-    WebhookInterval = 60, -- секунд между отчетами
-    TweenSpeed = 30,
-    MapOffset = 15,
-    MinSafeDistance = 80,
-    SafezoneTweenDuration = 2.5,
-    MaxCoins = 40,
+    WebhookInterval = 60, -- Интервал отчета в секундах
+    TweenSpeed = 32,      -- Скорость перемещения под картой
+    MapOffset = 15,       -- Глубина погружения под пол
+    MaxCoins = 40,        -- Лимит монет до сброса в войд
     NoUndergroundMaps = {"Yacht", "Pier2", "Pier"}
 }
 
-local FLING_TIMEOUT = 8.0
-local FLING_VELOCITY = Vector3.new(9999, 9999, 9999)
 local VOID_POSITION = Vector3.new(0, -500, 0)
 local LOBBY_POSITION = Vector3.new(-4981.51, 308.51, 3.79)
 
-local map
-local last_map_name
-local last_coin
+local map = nil
+local last_map_name = nil
 local is_resetting_in_void = false
-local has_flung_all_this_bag = false
-local is_flinging_all = false
 local can_tween = true
+local resetting_character = nil
+local has_reset_for_bag = false
 
 local players = game:GetService("Players")
 local localplayer = players.LocalPlayer
 local camera = workspace.CurrentCamera
-local resetting_character = nil
-local has_reset_for_bag = false
-local has_flung_murderer = false
-local round_start_time = 0
 
 -- Статистика для вебхуков
 local session_start = os.clock()
@@ -95,16 +86,6 @@ local function set_noclip()
     end
 end
 
-local function enable_full_collision()
-    local character = localplayer.Character
-    if not character then return end
-    for _, v in ipairs(character:GetDescendants()) do
-        if v:IsA("BasePart") then
-            v.CanCollide = true
-        end
-    end
-end
-
 local function find_map()
     for _, v in ipairs(workspace:GetChildren()) do
         if v:FindFirstChild("Spawns") and v.Name ~= "Lobby" then
@@ -116,28 +97,9 @@ end
 
 local function reset_round_state()
     is_resetting_in_void = false
-    has_flung_all_this_bag = false
-    is_flinging_all = false
     has_reset_for_bag = false
-    has_flung_murderer = false
     resetting_character = nil
-    last_coin = nil
     can_tween = true
-    round_start_time = os.clock()
-end
-
-local function get_safezone_position()
-    if is_valid(map) then
-        local spawns = map:FindFirstChild("Spawns")
-        if spawns then
-            for _, child in ipairs(spawns:GetChildren()) do
-                if child:IsA("BasePart") and child.Position then
-                    return child.Position + Vector3.new(250, 350, 250)
-                end
-            end
-        end
-    end
-    return LOBBY_POSITION
 end
 
 local function get_player_level()
@@ -204,10 +166,10 @@ local function send_webhook(is_bag_full)
             local cur_coins, _ = get_coin_info()
 
             local body = game:GetService("HttpService"):JSONEncode({
-                username = "MM2 Autofarm",
+                username = "MM2 Speed Autofarm",
                 avatar_url = "https://i.imgur.com/8Q9Z5gX.png",
                 embeds = {{
-                    title = is_bag_full and "🎒 Сумка заполнена | Ресет в войд" or "📊 Статистика фарма MM2",
+                    title = is_bag_full and "🎒 Сумка Заполнена | Ресет в Войд" or "📊 MM2 Farm Session Status",
                     color = is_bag_full and 16763904 or 4317924,
                     fields = {
                         { name = "👤 Игрок", value = "```" .. localplayer.Name .. "```", inline = true },
@@ -217,7 +179,7 @@ local function send_webhook(is_bag_full)
                         { name = "📈 Монет / час", value = "```" .. tostring(cph) .. " c/h```", inline = true },
                         { name = "⏱ Время фарма", value = "```" .. time_str .. "```", inline = true }
                     },
-                    footer = { text = "MM2 Executor Engine • " .. os.date("%H:%M:%S") }
+                    footer = { text = "Rage Under-Map Engine • " .. os.date("%H:%M:%S") }
                 }}
             })
 
@@ -232,101 +194,32 @@ local function send_webhook(is_bag_full)
     end)
 end
 
-local function get_knife_tool()
-    local character = localplayer.Character
-    local backpack = localplayer:FindFirstChild("Backpack")
-    if character then
-        local knife = character:FindFirstChild("Knife")
-        if knife and knife.ClassName == "Tool" then
-            return knife
-        end
-    end
-    if backpack then
-        local knife = backpack:FindFirstChild("Knife")
-        if knife and knife.ClassName == "Tool" then
-            return knife
-        end
-    end
-    return nil
-end
-
-local function am_i_murderer()
-    return get_knife_tool() ~= nil
-end
-
-local function get_threat()
-    local is_me_murderer = am_i_murderer()
-    for _, plr in ipairs(players:GetPlayers()) do
-        if plr ~= localplayer then
-            local character = plr.Character
-            local backpack = plr:FindFirstChild("Backpack")
-            local function check_inventory(inv)
-                if not inv then return false end
-                for _, child in ipairs(inv:GetChildren()) do
-                    if child.ClassName == "Tool" then
-                        local name = child.Name:lower()
-                        if is_me_murderer then
-                            if name:find("gun") then return true end
-                        else
-                            if name:find("knife") then return true end
-                        end
-                    end
-                end
-                return false
-            end
-            if check_inventory(character) or check_inventory(backpack) then
-                return plr, is_me_murderer and "Sheriff" or "Murderer"
-            end
-        end
-    end
-    return nil, is_me_murderer and "No Sheriff" or "No Murderer"
-end
-
+-- Поиск абсолютно ближайшей монеты без фильтрации по маньяку
 local function get_closest_coin()
     local character = localplayer.Character
-    if not character then return nil, math.huge, nil, "" end
+    if not character then return nil, math.huge end
     local humanoidrootpart = character:FindFirstChild("HumanoidRootPart")
-    if not humanoidrootpart then return nil, math.huge, nil, "" end
+    if not humanoidrootpart then return nil, math.huge end
     local coin_container = map and map:FindFirstChild("CoinContainer")
-    if not coin_container then return nil, math.huge, nil, "" end
-    local threat, threat_role = get_threat()
-    local threat_root = threat and threat.Character and threat.Character:FindFirstChild("HumanoidRootPart")
-    local safe_coins = {}
+    if not coin_container then return nil, math.huge end
+
+    local best_coin = nil
+    local shortest_dist = math.huge
 
     for _, coin in ipairs(coin_container:GetChildren()) do
         if is_valid(coin) and coin:FindFirstChild("TouchInterest") then
             local coin_pos = coin.Position
             if coin_pos then
-                local dist_to_player = magnitude(coin_pos, humanoidrootpart.Position)
-                local dist_to_threat = math.huge
-                if threat_root and threat_root.Position then
-                    dist_to_threat = magnitude(coin_pos, threat_root.Position)
-                end
-                if dist_to_threat >= Config.MinSafeDistance then
-                    table.insert(safe_coins, {
-                        coin = coin,
-                        dist_player = dist_to_player,
-                        dist_threat = dist_to_threat
-                    })
+                local dist = magnitude(coin_pos, humanoidrootpart.Position)
+                if dist < shortest_dist then
+                    shortest_dist = dist
+                    best_coin = coin
                 end
             end
         end
     end
 
-    local best_coin = nil
-    if #safe_coins > 0 then
-        best_coin = safe_coins[1]
-        for i = 2, #safe_coins do
-            if safe_coins[i].dist_player < best_coin.dist_player then
-                best_coin = safe_coins[i]
-            end
-        end
-    end
-
-    if best_coin then
-        return best_coin.coin, best_coin.dist_player, threat, threat_role
-    end
-    return nil, math.huge, threat, threat_role
+    return best_coin, shortest_dist
 end
 
 local function get_dynamic_underground_y()
@@ -356,7 +249,8 @@ local function is_water_map()
     return false
 end
 
-local function tween_position(object, target, duration, threat)
+-- Беспрерывный прямолинейный твин без проверок на маньяка
+local function tween_position(object, target, duration)
     if not duration or duration <= 0 then duration = 1 end
     can_tween = false
     local function cleanup()
@@ -374,15 +268,6 @@ local function tween_position(object, target, duration, threat)
                 if not is_valid(object) or not is_valid(target) or not is_valid(map) then
                     aborted = true
                     break
-                end
-                if threat and threat.Character then
-                    local root = threat.Character:FindFirstChild("HumanoidRootPart")
-                    if root and root.Position and object.Position then
-                        if magnitude(object.Position, root.Position) < Config.MinSafeDistance then
-                            aborted = true
-                            break
-                        end
-                    end
                 end
                 local alpha = (os.clock() - start_time) / time_sec
                 if alpha > 1 then alpha = 1 end
@@ -414,6 +299,7 @@ local function tween_position(object, target, duration, threat)
             local underground_y = get_dynamic_underground_y()
             local target_under_pos = Vector3.new(tgt_pos.X, underground_y, tgt_pos.Z)
             local current_under_pos = Vector3.new(obj_pos.X, underground_y, obj_pos.Z)
+
             if math.abs(obj_pos.Y - underground_y) > 2 then
                 move_to(current_under_pos, 0.04)
             end
@@ -438,47 +324,6 @@ local function tween_position(object, target, duration, threat)
     cleanup()
 end
 
-local function run_fling_murderer_sequence()
-    local character = localplayer.Character
-    if not character then return end
-    local hrp = character:FindFirstChild("HumanoidRootPart")
-    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:FindFirstChild("Humanoid")
-    if not hrp or not humanoid then return end
-    is_flinging_all = true
-    local threat_plr, _ = get_threat()
-    if threat_plr and threat_plr.Character and threat_plr.Character:FindFirstChild("HumanoidRootPart") then
-        local threat_hrp = threat_plr.Character.HumanoidRootPart
-        local threat_hum = threat_plr.Character:FindFirstChildOfClass("Humanoid") or threat_plr.Character:FindFirstChild("Humanoid")
-        set_status("Flinging Murderer: " .. threat_plr.Name, Color3.fromRGB(255, 150, 0))
-        local fling_start = os.clock()
-        while is_valid(character) and is_valid(hrp) and (humanoid and humanoid.Health > 0) and is_valid(threat_hrp) and (threat_hum and threat_hum.Health > 0) and threat_hrp.Position.Y > -100 do
-            if (os.clock() - fling_start) > FLING_TIMEOUT then
-                break
-            end
-            enable_full_collision()
-            local rot_angle = (os.clock() * 60) % 360
-            local rot_offset = Vector3.new(math.sin(rot_angle) * 0.1, 0, math.cos(rot_angle) * 0.1)
-            local threat_pos = threat_hrp.Position
-            if threat_pos then
-                hrp.Position = Vector3.new(
-                    threat_pos.X + rot_offset.X,
-                    threat_pos.Y + rot_offset.Y,
-                    threat_pos.Z + rot_offset.Z
-                )
-            end
-            hrp.Velocity = FLING_VELOCITY
-            pcall(function() hrp.AssemblyLinearVelocity = FLING_VELOCITY end)
-            task.wait(0.02)
-        end
-        if is_valid(hrp) then
-            hrp.Velocity = Vector3.new(0, 0, 0)
-            pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
-        end
-    end
-    has_flung_all_this_bag = true
-    is_flinging_all = false
-end
-
 local function update_auto_farm()
     map = find_map()
     local current_map_name = map and map.Name or nil
@@ -486,6 +331,7 @@ local function update_auto_farm()
         reset_round_state()
         last_map_name = current_map_name
     end
+
     local character = localplayer.Character
     if not character then
         set_status("Character missing", Color3.fromRGB(200, 200, 200))
@@ -507,7 +353,7 @@ local function update_auto_farm()
     end
 
     if is_resetting_in_void then
-        set_status("Bag Full: Resetting...", Color3.fromRGB(255, 90, 90))
+        set_status("Bag Full: Resetting in Void...", Color3.fromRGB(255, 90, 90))
         humanoidrootpart.Position = VOID_POSITION
         humanoidrootpart.Velocity = Vector3.new(0, -500, 0)
         pcall(function() humanoid.Health = 0 end)
@@ -516,21 +362,6 @@ local function update_auto_farm()
 
     if humanoid and humanoid.Health <= 0 then
         return
-    end
-
-    if is_flinging_all then
-        return
-    end
-
-    if has_reset_for_bag and not has_flung_murderer then
-        local is_murderer = am_i_murderer()
-        if not is_murderer then
-            has_flung_murderer = true
-            run_fling_murderer_sequence()
-            return
-        else
-            has_flung_murderer = true
-        end
     end
 
     set_noclip()
@@ -566,70 +397,29 @@ local function update_auto_farm()
     end
 
     if is_valid(map) then
-        if (os.clock() - round_start_time) < 3.5 then
-            local safezone = get_safezone_position()
-            set_status("Round Start: Staying in Safezone...", Color3.fromRGB(100, 230, 255))
-            humanoidrootpart.Velocity = Vector3.new(0, 0, 0)
-            humanoidrootpart.Position = safezone
-            can_tween = true
-            return
-        end
-
-        local closest_coin, coin_distance, threat, threat_role = get_closest_coin()
-
-        if threat and threat.Character then
-            local threat_root = threat.Character:FindFirstChild("HumanoidRootPart")
-            if threat_root and threat_root.Position then
-                local threat_pos = threat_root.Position
-                local my_pos = humanoidrootpart.Position
-                if threat_pos and my_pos and magnitude(my_pos, threat_pos) < Config.MinSafeDistance then
-                    local safezone = get_safezone_position()
-                    set_status("FLEEING " .. threat_role .. ": " .. threat.Name, Color3.fromRGB(255, 60, 60))
-                    humanoidrootpart.Velocity = Vector3.new(0, 0, 0)
-                    humanoidrootpart.Position = safezone
-                    can_tween = true
-                    return
-                end
-            end
-        end
+        local closest_coin, coin_distance = get_closest_coin()
 
         if is_valid(closest_coin) then
-            last_coin = closest_coin
             humanoidrootpart.Velocity = Vector3.new(0, 0, 0)
-            local threat_info = threat and ("Evading " .. threat_role .. ": " .. threat.Name) or "Safe"
-            local color = Color3.fromRGB(80, 230, 130)
-            if threat then
-                if threat_role == "Sheriff" then
-                    color = Color3.fromRGB(100, 160, 255)
-                else
-                    color = Color3.fromRGB(255, 80, 80)
-                end
-            end
-            set_status(threat_info .. " | Bag: " .. coin_val .. " | Total: " .. session_coins, color)
+            set_status("RAGE FARMING | Bag: " .. coin_val .. " | Total: " .. session_coins, Color3.fromRGB(0, 255, 140))
             if can_tween then
                 local dur = coin_distance / Config.TweenSpeed
-                if coin_distance > 500 then
-                    dur = Config.SafezoneTweenDuration
-                end
                 task.spawn(function()
-                    tween_position(humanoidrootpart, closest_coin, dur, threat)
+                    tween_position(humanoidrootpart, closest_coin, dur)
                 end)
             end
         else
-            local safezone = get_safezone_position()
-            set_status("Waiting... | Coins: " .. coin_val, Color3.fromRGB(255, 210, 80))
-            humanoidrootpart.Velocity = Vector3.new(0, 0, 0)
-            humanoidrootpart.Position = safezone
+            set_status("Searching Coins... | Coins: " .. coin_val, Color3.fromRGB(255, 210, 80))
         end
     else
-        set_status("IDLE (Lobby)", Color3.fromRGB(200, 200, 200))
+        set_status("LOBBY (Waiting for Map)", Color3.fromRGB(200, 200, 200))
     end
 end
 
--- Отправка стартового вебхука
+-- Отправка стартового подтверждения
 send_webhook(false)
 
--- Главный цикл
+-- Главный непрерывный цикл
 while true do
     pcall(function()
         update_auto_farm()

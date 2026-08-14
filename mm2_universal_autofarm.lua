@@ -1,6 +1,6 @@
 --[[
     ===================================================================
-    MM2 Rage Autofarm (Precise Stats Tracking Edition)
+    MM2 Rage Autofarm (Live Balance & Exact Level Edition)
     Direct Under-Map Coin Sniping + Discord Webhooks + Instant Void Reset
     100% Compatible with all standard Roblox Executors (Solara, Wave, etc.)
     ===================================================================
@@ -29,10 +29,10 @@ local players = game:GetService("Players")
 local localplayer = players.LocalPlayer or players.PlayerAdded:Wait()
 local camera = workspace.CurrentCamera
 
--- Статистика для вебхуков
+-- Статистика сессии
 local session_start = os.clock()
 local session_coins = 0
-local last_coin_count = 0
+local last_bag_count = 0
 local last_webhook_time = os.clock()
 
 local http_req = (syn and syn.request) 
@@ -102,38 +102,83 @@ local function reset_round_state()
     can_tween = true
 end
 
--- Точный поиск уровня игрока
-local function get_player_level()
+-- Точный поиск реального уровня (проверено в live-сессии Matcha)
+local function get_real_level()
     local lvl = 0
-
-    -- 1. Модуль PlayerData в ReplicatedStorage (основная база данных MM2)
     pcall(function()
-        local rs = game:GetService("ReplicatedStorage")
-        local modules = rs:FindFirstChild("Modules")
-        local pdMod = modules and modules:FindFirstChild("PlayerData")
-        if pdMod then
-            local pd = require(pdMod)
-            if pd and pd[localplayer.Name] and pd[localplayer.Name].Level then
-                local l = tonumber(pd[localplayer.Name].Level)
-                if l and l > 0 then lvl = l end
+        local mg = localplayer.PlayerGui:FindFirstChild("MainGUI")
+        if not mg then return end
+        
+        -- 1. Чтение из таблицы лидеров текущего сервера
+        local gameGui = mg:FindFirstChild("Game")
+        if gameGui then
+            local lb = gameGui:FindFirstChild("Leaderboard")
+            local cont = lb and lb:FindFirstChild("Container")
+            local pFrame = cont and cont:FindFirstChild(localplayer.Name)
+            if pFrame and pFrame:FindFirstChild("Level") then
+                local lvlNode = pFrame.Level:FindFirstChild("Level")
+                if lvlNode and lvlNode.Text and lvlNode.Text ~= "failed to fetch text" then
+                    local num = tonumber(lvlNode.Text:match("(%d+)"))
+                    if num and num > 0 then
+                        lvl = num
+                        return
+                    end
+                end
+            end
+
+            -- 2. Чтение из виджета уровня в игре (Level.LevelText)
+            local g_lvl = gameGui:FindFirstChild("Level")
+            if g_lvl and g_lvl:FindFirstChild("LevelText") then
+                local t = g_lvl.LevelText.Text
+                if t and t ~= "failed to fetch text" then
+                    local num = tonumber(t:match("(%d+)"))
+                    if num and num > 0 then
+                        lvl = num
+                        return
+                    end
+                end
             end
         end
     end)
-    if lvl > 0 then return lvl end
+    return lvl
+end
 
-    -- 2. Сканирование плашек MainGUI (Profile / Dock / Level Badge)
+-- Монеты в сумке за текущий раунд (0 - 40, проверено в live-сессии Matcha)
+local function get_bag_coins()
+    local bag_coins = 0
     pcall(function()
-        local pGui = localplayer:FindFirstChild("PlayerGui")
-        local mg = pGui and pGui:FindFirstChild("MainGUI")
+        local mg = localplayer.PlayerGui:FindFirstChild("MainGUI")
+        if not mg then return end
+        local gameGui = mg:FindFirstChild("Game")
+        local coinBags = gameGui and gameGui:FindFirstChild("CoinBags")
+        local container = coinBags and coinBags:FindFirstChild("Container")
+        if container then
+            local coin = container:FindFirstChild("Coin")
+            if coin and coin:FindFirstChild("CurrencyFrame") and coin.CurrencyFrame:FindFirstChild("Icon") and coin.CurrencyFrame.Icon:FindFirstChild("Coins") then
+                local t = coin.CurrencyFrame.Icon.Coins.Text
+                bag_coins = tonumber(t) or 0
+                return
+            end
+        end
+    end)
+    return bag_coins
+end
+
+-- Общий баланс монет (чтение из бейджей либо persistent stats)
+local function get_account_balance()
+    local balance = 0
+    pcall(function()
+        local mg = localplayer.PlayerGui:FindFirstChild("MainGUI")
         if mg then
-            for _, desc in ipairs(mg:GetDescendants()) do
-                if desc:IsA("TextLabel") and desc.Visible and desc.Text and #desc.Text > 0 then
-                    local dName = desc.Name:lower()
-                    local pName = desc.Parent and desc.Parent.Name:lower() or ""
-                    if dName:find("level") or pName:find("level") or dName:find("lvl") or pName:find("profile") or pName:find("badge") then
-                        local n = tonumber(desc.Text:match("(%d+)"))
-                        if n and n > 0 and n <= 5000 then
-                            lvl = n
+            for _, v in ipairs(mg:GetDescendants()) do
+                if v.ClassName == "TextLabel" and v.Text and v.Text ~= "failed to fetch text" then
+                    local rawText = v.Text:gsub(",", ""):gsub("%s", "")
+                    local num = tonumber(rawText:match("^%d+$"))
+                    if num and num > 100 and num < 100000000 then
+                        local pName = v.Parent and v.Parent.Name:lower() or ""
+                        local vName = v.Name:lower()
+                        if pName:find("coin") or pName:find("currency") or vName:find("coin") or vName:find("currency") or pName:find("top") or pName:find("bar") or pName:find("dock") then
+                            balance = num
                             return
                         end
                     end
@@ -141,80 +186,26 @@ local function get_player_level()
             end
         end
     end)
-    if lvl > 0 then return lvl end
-
-    -- 3. Fallback через leaderstats
-    pcall(function()
-        local ls = localplayer:FindFirstChild("leaderstats")
-        if ls and ls:FindFirstChild("Level") then
-            lvl = tonumber(ls.Level.Value) or 0
-        end
-    end)
-
-    return lvl
+    return balance
 end
 
--- Точный подсчет монет в сумке
-local function get_coin_info()
-    local total_coins = 0
-
-    pcall(function()
-        local pGui = localplayer:FindFirstChild("PlayerGui")
-        local mainGui = pGui and pGui:FindFirstChild("MainGUI")
-        if mainGui then
-            -- 1. Во время раунда (Game.CoinBags)
-            local gameGui = mainGui:FindFirstChild("Game")
-            local coinBags = gameGui and gameGui:FindFirstChild("CoinBags")
-            if coinBags then
-                local container = coinBags:FindFirstChild("Container")
-                if container then
-                    for _, child in ipairs(container:GetChildren()) do
-                        if child:IsA("Frame") then
-                            local icon = child:FindFirstChild("Icon", true)
-                            local label = icon and icon:FindFirstChild("Coins") or child:FindFirstChild("Coins", true)
-                            if label and label:IsA("TextLabel") and label.Text then
-                                local num = tonumber(label.Text:match("(%d+)"))
-                                if num then
-                                    total_coins = total_coins + num
-                                end
-                            end
-                        end
-                    end
-                end
-                if total_coins == 0 then
-                    local directCoins = coinBags:FindFirstChild("Coins", true)
-                    if directCoins and directCoins:IsA("TextLabel") and directCoins.Text then
-                        local num = tonumber(directCoins.Text:match("(%d+)"))
-                        if num then total_coins = num end
-                    end
-                end
-            end
-
-            -- 2. В лобби (Lobby.Dock.CoinBags)
-            if total_coins == 0 then
-                local lobby = mainGui:FindFirstChild("Lobby")
-                local dock = lobby and lobby:FindFirstChild("Dock")
-                local coinBagsLobby = dock and dock:FindFirstChild("CoinBags")
-                if coinBagsLobby then
-                    local label = coinBagsLobby:FindFirstChild("Coins", true)
-                    if label and label:IsA("TextLabel") and label.Text then
-                        local num = tonumber(label.Text:match("(%d+)"))
-                        if num then total_coins = num end
-                    end
-                end
-            end
-        end
-    end)
-
-    local is_full = (total_coins >= Config.MaxCoins)
-    return total_coins, is_full
+local function is_bag_full_check()
+    local bag_coins = get_bag_coins()
+    return (bag_coins >= (Config.MaxCoins or 40))
 end
+
+local is_webhook_sending = false
+local last_bag_webhook_time = 0
 
 local function send_webhook(is_bag_full)
+    if is_webhook_sending then return end
     if not http_req or not Config.WebhookURL or #Config.WebhookURL < 15 then return end
 
+    is_webhook_sending = true
+    last_webhook_time = os.clock()
+
     task.spawn(function()
-        pcall(function()
+        local ok, err = pcall(function()
             local elapsed = os.clock() - session_start
             local hours = math.floor(elapsed / 3600)
             local mins = math.floor((elapsed % 3600) / 60)
@@ -226,19 +217,21 @@ local function send_webhook(is_bag_full)
                 cph = math.floor(session_coins / (elapsed / 3600))
             end
 
-            local lvl = get_player_level()
-            local cur_coins, _ = get_coin_info()
+            local lvl = get_real_level()
+            local totalBalance = get_account_balance()
+            local curBag = get_bag_coins()
 
             local body = game:GetService("HttpService"):JSONEncode({
                 username = "MM2 Speed Autofarm",
                 avatar_url = "https://i.imgur.com/8Q9Z5gX.png",
                 embeds = {{
-                    title = is_bag_full and "🎒 Сумка Заполнена | Ресет в Войд" or "📊 MM2 Farm Session Status",
+                    title = is_bag_full and "🎒 Сумка Заполнена (40) | Ресет в Войд" or "📊 MM2 Farm Session Status",
                     color = is_bag_full and 16763904 or 4317924,
                     fields = {
                         { name = "👤 Игрок", value = "```" .. localplayer.Name .. "```", inline = true },
                         { name = "⭐ Уровень", value = "```" .. tostring(lvl) .. "```", inline = true },
-                        { name = "💰 В сумке", value = "```" .. tostring(cur_coins) .. " / " .. tostring(Config.MaxCoins) .. "```", inline = true },
+                        { name = "💰 Баланс монет", value = "```" .. (totalBalance > 0 and tostring(totalBalance) or "Синхр...") .. "```", inline = true },
+                        { name = "🎒 В сумке", value = "```" .. tostring(curBag) .. " / " .. tostring(Config.MaxCoins) .. "```", inline = true },
                         { name = "🪙 За сессию", value = "```" .. tostring(session_coins) .. "```", inline = true },
                         { name = "📈 Монет / час", value = "```" .. tostring(cph) .. " c/h```", inline = true },
                         { name = "⏱ Время фарма", value = "```" .. time_str .. "```", inline = true }
@@ -253,10 +246,21 @@ local function send_webhook(is_bag_full)
                 Headers = { ["Content-Type"] = "application/json" },
                 Body = body
             })
-            last_webhook_time = os.clock()
         end)
+        task.wait(1.0)
+        is_webhook_sending = false
     end)
 end
+
+-- Отдельный фоновый таймер отправки отчетов строго раз в WebhookInterval
+task.spawn(function()
+    while true do
+        task.wait(2.0)
+        if (os.clock() - last_webhook_time) >= (Config.WebhookInterval or 60) then
+            send_webhook(false)
+        end
+    end
+end)
 
 -- Поиск абсолютно ближайшей монеты без фильтрации по маньяку
 local function get_closest_coin()
@@ -313,7 +317,7 @@ local function is_water_map()
     return false
 end
 
--- Беспрерывный прямолинейный твин без проверок на маньяка
+-- Прямолинейный твин под пол
 local function tween_position(object, target, duration)
     if not duration or duration <= 0 then duration = 1 end
     can_tween = false
@@ -429,31 +433,30 @@ local function update_auto_farm()
     end
 
     set_noclip()
-    local coin_val, is_bag_full = get_coin_info()
+    local bag_val = get_bag_coins()
+    local is_bag_full = (bag_val >= (Config.MaxCoins or 40))
 
-    if not is_bag_full and coin_val < Config.MaxCoins then
+    if not is_bag_full and bag_val < Config.MaxCoins then
         has_reset_for_bag = false
     end
 
     -- Статистика монет
-    if coin_val > last_coin_count then
-        local diff = coin_val - last_coin_count
+    if bag_val > last_bag_count then
+        local diff = bag_val - last_bag_count
         if diff <= 50 then
             session_coins = session_coins + diff
         end
     end
-    last_coin_count = coin_val
-
-    -- Периодический вебхук
-    if (os.clock() - last_webhook_time) >= Config.WebhookInterval then
-        send_webhook(false)
-    end
+    last_bag_count = bag_val
 
     if is_bag_full and not has_reset_for_bag then
         is_resetting_in_void = true
         resetting_character = character
-        set_status("Bag Full (" .. coin_val .. "): Resetting...", Color3.fromRGB(255, 90, 90))
-        send_webhook(true)
+        set_status("Bag Full (" .. bag_val .. "): Resetting...", Color3.fromRGB(255, 90, 90))
+        if (os.clock() - last_bag_webhook_time) >= 15 then
+            last_bag_webhook_time = os.clock()
+            send_webhook(true)
+        end
         humanoidrootpart.Position = VOID_POSITION
         humanoidrootpart.Velocity = Vector3.new(0, -500, 0)
         pcall(function() humanoid.Health = 0 end)
@@ -465,7 +468,7 @@ local function update_auto_farm()
 
         if is_valid(closest_coin) then
             humanoidrootpart.Velocity = Vector3.new(0, 0, 0)
-            set_status("RAGE FARMING | Bag: " .. coin_val .. " | Total: " .. session_coins, Color3.fromRGB(0, 255, 140))
+            set_status("RAGE FARMING | Bag: " .. bag_val .. " | Total: " .. session_coins, Color3.fromRGB(0, 255, 140))
             if can_tween then
                 local dur = coin_distance / Config.TweenSpeed
                 task.spawn(function()
@@ -473,14 +476,14 @@ local function update_auto_farm()
                 end)
             end
         else
-            set_status("Searching Coins... | Coins: " .. coin_val, Color3.fromRGB(255, 210, 80))
+            set_status("Searching Coins... | Bag: " .. bag_val, Color3.fromRGB(255, 210, 80))
         end
     else
         set_status("LOBBY (Waiting for Map)", Color3.fromRGB(200, 200, 200))
     end
 end
 
--- Отправка стартового подтверждения
+-- Стартовая отправка подтверждения
 send_webhook(false)
 
 -- Главный непрерывный цикл

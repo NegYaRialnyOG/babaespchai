@@ -1,6 +1,6 @@
 --[[
     ===================================================================
-    MM2 Rage Autofarm (No Evade / Pure Speed Mode)
+    MM2 Rage Autofarm (Precise Stats Tracking Edition)
     Direct Under-Map Coin Sniping + Discord Webhooks + Instant Void Reset
     100% Compatible with all standard Roblox Executors (Solara, Wave, etc.)
     ===================================================================
@@ -26,7 +26,7 @@ local resetting_character = nil
 local has_reset_for_bag = false
 
 local players = game:GetService("Players")
-local localplayer = players.LocalPlayer
+local localplayer = players.LocalPlayer or players.PlayerAdded:Wait()
 local camera = workspace.CurrentCamera
 
 -- Статистика для вебхуков
@@ -102,46 +102,110 @@ local function reset_round_state()
     can_tween = true
 end
 
+-- Точный поиск уровня игрока
 local function get_player_level()
     local lvl = 0
+
+    -- 1. Модуль PlayerData в ReplicatedStorage (основная база данных MM2)
     pcall(function()
-        local leaderstats = localplayer:FindFirstChild("leaderstats")
-        if leaderstats and leaderstats:FindFirstChild("Level") then
-            lvl = tonumber(leaderstats.Level.Value) or 0
-        end
-        if lvl == 0 then
-            local mainGui = localplayer.PlayerGui:FindFirstChild("MainGUI")
-            if mainGui then
-                local l = mainGui:FindFirstChild("Level", true)
-                if l and l:IsA("TextLabel") and l.Text then
-                    lvl = tonumber(l.Text:match("%d+")) or 0
-                end
+        local rs = game:GetService("ReplicatedStorage")
+        local modules = rs:FindFirstChild("Modules")
+        local pdMod = modules and modules:FindFirstChild("PlayerData")
+        if pdMod then
+            local pd = require(pdMod)
+            if pd and pd[localplayer.Name] and pd[localplayer.Name].Level then
+                local l = tonumber(pd[localplayer.Name].Level)
+                if l and l > 0 then lvl = l end
             end
         end
     end)
-    return lvl
-end
+    if lvl > 0 then return lvl end
 
-local function get_coin_info()
-    local total_coins = 0
+    -- 2. Сканирование плашек MainGUI (Profile / Dock / Level Badge)
     pcall(function()
-        local coin_bags = localplayer.PlayerGui.MainGUI.Game.CoinBags
-        local container = coin_bags:FindFirstChild("Container")
-        if not container then return end
-        for _, child in ipairs(container:GetChildren()) do
-            if child.ClassName == "Frame" then
-                local currency = child:FindFirstChild("CurrencyFrame")
-                local icon = currency and currency:FindFirstChild("Icon")
-                local text_label = icon and icon:FindFirstChild("Coins")
-                if text_label and text_label.Text then
-                    local num = tonumber(text_label.Text:match("%d+"))
-                    if num then
-                        total_coins = total_coins + num
+        local pGui = localplayer:FindFirstChild("PlayerGui")
+        local mg = pGui and pGui:FindFirstChild("MainGUI")
+        if mg then
+            for _, desc in ipairs(mg:GetDescendants()) do
+                if desc:IsA("TextLabel") and desc.Visible and desc.Text and #desc.Text > 0 then
+                    local dName = desc.Name:lower()
+                    local pName = desc.Parent and desc.Parent.Name:lower() or ""
+                    if dName:find("level") or pName:find("level") or dName:find("lvl") or pName:find("profile") or pName:find("badge") then
+                        local n = tonumber(desc.Text:match("(%d+)"))
+                        if n and n > 0 and n <= 5000 then
+                            lvl = n
+                            return
+                        end
                     end
                 end
             end
         end
     end)
+    if lvl > 0 then return lvl end
+
+    -- 3. Fallback через leaderstats
+    pcall(function()
+        local ls = localplayer:FindFirstChild("leaderstats")
+        if ls and ls:FindFirstChild("Level") then
+            lvl = tonumber(ls.Level.Value) or 0
+        end
+    end)
+
+    return lvl
+end
+
+-- Точный подсчет монет в сумке
+local function get_coin_info()
+    local total_coins = 0
+
+    pcall(function()
+        local pGui = localplayer:FindFirstChild("PlayerGui")
+        local mainGui = pGui and pGui:FindFirstChild("MainGUI")
+        if mainGui then
+            -- 1. Во время раунда (Game.CoinBags)
+            local gameGui = mainGui:FindFirstChild("Game")
+            local coinBags = gameGui and gameGui:FindFirstChild("CoinBags")
+            if coinBags then
+                local container = coinBags:FindFirstChild("Container")
+                if container then
+                    for _, child in ipairs(container:GetChildren()) do
+                        if child:IsA("Frame") then
+                            local icon = child:FindFirstChild("Icon", true)
+                            local label = icon and icon:FindFirstChild("Coins") or child:FindFirstChild("Coins", true)
+                            if label and label:IsA("TextLabel") and label.Text then
+                                local num = tonumber(label.Text:match("(%d+)"))
+                                if num then
+                                    total_coins = total_coins + num
+                                end
+                            end
+                        end
+                    end
+                end
+                if total_coins == 0 then
+                    local directCoins = coinBags:FindFirstChild("Coins", true)
+                    if directCoins and directCoins:IsA("TextLabel") and directCoins.Text then
+                        local num = tonumber(directCoins.Text:match("(%d+)"))
+                        if num then total_coins = num end
+                    end
+                end
+            end
+
+            -- 2. В лобби (Lobby.Dock.CoinBags)
+            if total_coins == 0 then
+                local lobby = mainGui:FindFirstChild("Lobby")
+                local dock = lobby and lobby:FindFirstChild("Dock")
+                local coinBagsLobby = dock and dock:FindFirstChild("CoinBags")
+                if coinBagsLobby then
+                    local label = coinBagsLobby:FindFirstChild("Coins", true)
+                    if label and label:IsA("TextLabel") and label.Text then
+                        local num = tonumber(label.Text:match("(%d+)"))
+                        if num then total_coins = num end
+                    end
+                end
+            end
+        end
+    end)
+
     local is_full = (total_coins >= Config.MaxCoins)
     return total_coins, is_full
 end

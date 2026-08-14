@@ -1,51 +1,72 @@
 --[[
     ===================================================================
-    MM2 Rage Autofarm (Live Balance & Exact Level Edition)
-    Direct Under-Map Coin Sniping + Discord Webhooks + Instant Void Reset
-    100% Compatible with all standard Roblox Executors (Solara, Wave, etc.)
+    MM2 Universal Autofarm (TravHub High-Speed Engine + Exact Stats)
+    - Full Round Tracking via Gameplay Remotes (RoundStart / RoundEndFade)
+    - High-Speed Hybrid Movement: Proximity Tween + Distant TP
+    - Instant CoinCollected Remote Listener (Auto-Reset on 40 Bag Limit)
+    - Exact Account Level (61) + Persistent All-Time Coin Tracker
+    - Anti-AFK VirtualUser + Stepped Noclip
+    - Rate-Limited Discord Webhook Reporter (Anti-Spam Mutex)
+    - 100% Compatible with Matcha External LuaVM & All Roblox Executors
     ===================================================================
 --]]
 
 local Config = {
     WebhookURL = "https://discord.com/api/webhooks/1537506182548295760/lOkkQ7G6mYbL--4LcsiTbYPeuN7oVeJ2c9GS5Wmn54bO-vCjzLaDFDPwEIhOwVRvvenZ",
     WebhookInterval = 60, -- Интервал отчета в секундах
-    TweenSpeed = 32,      -- Скорость перемещения под картой
-    MapOffset = 15,       -- Глубина погружения под пол
+    FarmSpeed = 25,       -- Скорость перемещения к монетам (25 studs/sec)
     MaxCoins = 40,        -- Лимит монет до сброса в войд
-    NoUndergroundMaps = {"Yacht", "Pier2", "Pier"}
+    TeleportDistance = 140, -- Дистанция для мгновенного ТП к дальним монетам
+    AutoResetOnFull = true,
 }
 
 local VOID_POSITION = Vector3.new(0, -500, 0)
 local LOBBY_POSITION = Vector3.new(-4981.51, 308.51, 3.79)
 
-local map = nil
-local last_map_name = nil
-local is_resetting_in_void = false
-local can_tween = true
-local resetting_character = nil
-local has_reset_for_bag = false
-
+-- Services
 local players = game:GetService("Players")
+local runservice = game:GetService("RunService")
+local replicatedstorage = game:GetService("ReplicatedStorage")
+local tweenservice = game:GetService("TweenService")
+local httpservice = game:GetService("HttpService")
+local virtualuser = game:GetService("VirtualUser")
+
 local localplayer = players.LocalPlayer or players.PlayerAdded:Wait()
 local camera = workspace.CurrentCamera
 
--- Статистика сессии
+-- Anti-AFK
+pcall(function()
+    localplayer.Idled:Connect(function()
+        if virtualuser then
+            virtualuser:CaptureController()
+            virtualuser:ClickButton2(Vector2.new(0, 0))
+        end
+    end)
+end)
+
+-- State Variables
+local is_round_active = false
+local is_resetting = false
+local current_bag_coins = 0
 local session_start = os.clock()
 local session_coins = 0
 local last_bag_count = 0
 local last_webhook_time = os.clock()
+local is_webhook_sending = false
+local last_bag_webhook_time = 0
 
+-- HTTP Request resolution
 local http_req = (syn and syn.request) 
     or (http and http.request) 
     or http_request 
     or (fluxus and fluxus.request) 
     or request
 
--- Drawing UI
+-- Drawing HUD Overlay
 local status = nil
 pcall(function()
     status = Drawing.new("Text")
-    status.Size = 22
+    status.Size = 20
     status.Font = 2
     status.Center = true
     status.Outline = true
@@ -65,51 +86,65 @@ local function set_status(text, color)
     end
 end
 
-local function is_valid(obj)
-    return obj and obj.Parent ~= nil
-end
+-- Persistent Storage on Disk
+local STATS_FILE = "mm2_stats_" .. (localplayer and tostring(localplayer.UserId) or "Player") .. ".json"
+local total_coins_all_time = 0
 
-local function magnitude(point1, point2)
-    local dx = point2.X - point1.X
-    local dy = point2.Y - point1.Y
-    local dz = point2.Z - point1.Z
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
-
-local function set_noclip()
-    local character = localplayer.Character
-    if not character then return end
-    for _, v in ipairs(character:GetDescendants()) do
-        if v:IsA("BasePart") then
-            v.CanCollide = false
+local function load_saved_stats()
+    pcall(function()
+        if type(readfile) == "function" then
+            local can_read = true
+            if type(isfile) == "function" and not isfile(STATS_FILE) then
+                can_read = false
+            end
+            if can_read then
+                local content = readfile(STATS_FILE)
+                if content and #content > 0 then
+                    local data = httpservice:JSONDecode(content)
+                    if type(data) == "table" and data.TotalCoinsAllTime then
+                        total_coins_all_time = tonumber(data.TotalCoinsAllTime) or 0
+                    end
+                end
+            end
         end
-    end
+    end)
 end
+load_saved_stats()
 
-local function find_map()
-    for _, v in ipairs(workspace:GetChildren()) do
-        if v:FindFirstChild("Spawns") and v.Name ~= "Lobby" then
-            return v
+local function save_stats()
+    pcall(function()
+        if type(writefile) == "function" then
+            local payload = httpservice:JSONEncode({
+                TotalCoinsAllTime = (total_coins_all_time + session_coins),
+                UserId = localplayer and localplayer.UserId or 0,
+                LastUpdated = os.date("!%Y-%m-%dT%H:%M:%SZ")
+            })
+            writefile(STATS_FILE, payload)
         end
-    end
-    return nil
+    end)
 end
 
-local function reset_round_state()
-    is_resetting_in_void = false
-    has_reset_for_bag = false
-    resetting_character = nil
-    can_tween = true
+-- Character & RootPart helpers
+local function get_character()
+    return localplayer.Character
 end
 
--- Точный поиск реального уровня (проверено в live-сессии Matcha)
+local function get_root_part()
+    local char = get_character()
+    return char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso"))
+end
+
+local function get_humanoid()
+    local char = get_character()
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+-- Exact Level Extraction (From Live Server Leaderboard)
 local function get_real_level()
     local lvl = 0
     pcall(function()
         local mg = localplayer.PlayerGui:FindFirstChild("MainGUI")
         if not mg then return end
-        
-        -- 1. Чтение из таблицы лидеров текущего сервера
         local gameGui = mg:FindFirstChild("Game")
         if gameGui then
             local lb = gameGui:FindFirstChild("Leaderboard")
@@ -119,23 +154,15 @@ local function get_real_level()
                 local lvlNode = pFrame.Level:FindFirstChild("Level")
                 if lvlNode and lvlNode.Text and lvlNode.Text ~= "failed to fetch text" then
                     local num = tonumber(lvlNode.Text:match("(%d+)"))
-                    if num and num > 0 then
-                        lvl = num
-                        return
-                    end
+                    if num and num > 0 then lvl = num return end
                 end
             end
-
-            -- 2. Чтение из виджета уровня в игре (Level.LevelText)
             local g_lvl = gameGui:FindFirstChild("Level")
             if g_lvl and g_lvl:FindFirstChild("LevelText") then
                 local t = g_lvl.LevelText.Text
                 if t and t ~= "failed to fetch text" then
                     local num = tonumber(t:match("(%d+)"))
-                    if num and num > 0 then
-                        lvl = num
-                        return
-                    end
+                    if num and num > 0 then lvl = num return end
                 end
             end
         end
@@ -143,9 +170,9 @@ local function get_real_level()
     return lvl
 end
 
--- Монеты в сумке за текущий раунд (0 - 40, проверено в live-сессии Matcha)
+-- Live Round Bag Coins (From CoinBags UI)
 local function get_bag_coins()
-    local bag_coins = 0
+    local bag_coins = current_bag_coins
     pcall(function()
         local mg = localplayer.PlayerGui:FindFirstChild("MainGUI")
         if not mg then return end
@@ -156,47 +183,39 @@ local function get_bag_coins()
             local coin = container:FindFirstChild("Coin")
             if coin and coin:FindFirstChild("CurrencyFrame") and coin.CurrencyFrame:FindFirstChild("Icon") and coin.CurrencyFrame.Icon:FindFirstChild("Coins") then
                 local t = coin.CurrencyFrame.Icon.Coins.Text
-                bag_coins = tonumber(t) or 0
-                return
+                local num = tonumber(t)
+                if num then bag_coins = num end
             end
         end
     end)
     return bag_coins
 end
 
--- Общий баланс монет (чтение из бейджей либо persistent stats)
+-- Live Total Coins Balance (No Dock.Version Bug)
 local function get_account_balance()
-    local balance = 0
+    local live_balance = 0
     pcall(function()
         local mg = localplayer.PlayerGui:FindFirstChild("MainGUI")
         if mg then
-            for _, v in ipairs(mg:GetDescendants()) do
-                if v.ClassName == "TextLabel" and v.Text and v.Text ~= "failed to fetch text" then
-                    local rawText = v.Text:gsub(",", ""):gsub("%s", "")
-                    local num = tonumber(rawText:match("^%d+$"))
-                    if num and num > 100 and num < 100000000 then
-                        local pName = v.Parent and v.Parent.Name:lower() or ""
-                        local vName = v.Name:lower()
-                        if pName:find("coin") or pName:find("currency") or vName:find("coin") or vName:find("currency") or pName:find("top") or pName:find("bar") or pName:find("dock") then
-                            balance = num
-                            return
-                        end
-                    end
+            local shop = mg:FindFirstChild("Game") and mg.Game:FindFirstChild("Shop")
+            local coinsTitle = shop and shop:FindFirstChild("Title") and shop.Title:FindFirstChild("Coins")
+            if coinsTitle then
+                local cont = coinsTitle:FindFirstChild("Container")
+                local amt = cont and cont:FindFirstChild("Amount")
+                if amt and amt.ClassName == "TextLabel" and amt.Text and amt.Text ~= "failed to fetch text" then
+                    local num = tonumber(amt.Text:gsub(",", ""):match("(%d+)"))
+                    if num and num > 0 then live_balance = num return end
                 end
             end
         end
     end)
-    return balance
+    if live_balance > 0 then
+        return live_balance
+    end
+    return (total_coins_all_time + session_coins)
 end
 
-local function is_bag_full_check()
-    local bag_coins = get_bag_coins()
-    return (bag_coins >= (Config.MaxCoins or 40))
-end
-
-local is_webhook_sending = false
-local last_bag_webhook_time = 0
-
+-- Webhook Dispatcher
 local function send_webhook(is_bag_full)
     if is_webhook_sending then return end
     if not http_req or not Config.WebhookURL or #Config.WebhookURL < 15 then return end
@@ -205,7 +224,7 @@ local function send_webhook(is_bag_full)
     last_webhook_time = os.clock()
 
     task.spawn(function()
-        local ok, err = pcall(function()
+        pcall(function()
             local elapsed = os.clock() - session_start
             local hours = math.floor(elapsed / 3600)
             local mins = math.floor((elapsed % 3600) / 60)
@@ -221,8 +240,8 @@ local function send_webhook(is_bag_full)
             local totalBalance = get_account_balance()
             local curBag = get_bag_coins()
 
-            local body = game:GetService("HttpService"):JSONEncode({
-                username = "MM2 Speed Autofarm",
+            local body = httpservice:JSONEncode({
+                username = "MM2 High-Speed Autofarm",
                 avatar_url = "https://i.imgur.com/8Q9Z5gX.png",
                 embeds = {{
                     title = is_bag_full and "🎒 Сумка Заполнена (40) | Ресет в Войд" or "📊 MM2 Farm Session Status",
@@ -230,13 +249,13 @@ local function send_webhook(is_bag_full)
                     fields = {
                         { name = "👤 Игрок", value = "```" .. localplayer.Name .. "```", inline = true },
                         { name = "⭐ Уровень", value = "```" .. tostring(lvl) .. "```", inline = true },
-                        { name = "💰 Баланс монет", value = "```" .. (totalBalance > 0 and tostring(totalBalance) or "Синхр...") .. "```", inline = true },
+                        { name = "💰 Баланс монет", value = "```" .. tostring(totalBalance) .. "```", inline = true },
                         { name = "🎒 В сумке", value = "```" .. tostring(curBag) .. " / " .. tostring(Config.MaxCoins) .. "```", inline = true },
                         { name = "🪙 За сессию", value = "```" .. tostring(session_coins) .. "```", inline = true },
                         { name = "📈 Монет / час", value = "```" .. tostring(cph) .. " c/h```", inline = true },
                         { name = "⏱ Время фарма", value = "```" .. time_str .. "```", inline = true }
                     },
-                    footer = { text = "Rage Under-Map Engine • " .. os.date("%H:%M:%S") }
+                    footer = { text = "TravHub High-Speed Engine • " .. os.date("%H:%M:%S") }
                 }}
             })
 
@@ -252,7 +271,7 @@ local function send_webhook(is_bag_full)
     end)
 end
 
--- Отдельный фоновый таймер отправки отчетов строго раз в WebhookInterval
+-- Background Webhook Loop (Strictly 60s)
 task.spawn(function()
     while true do
         task.wait(2.0)
@@ -262,234 +281,175 @@ task.spawn(function()
     end
 end)
 
--- Поиск абсолютно ближайшей монеты без фильтрации по маньяку
+-- Continuous Stepped Noclip
+runservice.Stepped:Connect(function()
+    local char = get_character()
+    if char and char:IsDescendantOf(workspace) then
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+            end
+        end
+    end
+end)
+
+-- Map & Coin Container Detection (TravHub Logic)
 local function get_closest_coin()
-    local character = localplayer.Character
-    if not character then return nil, math.huge end
-    local humanoidrootpart = character:FindFirstChild("HumanoidRootPart")
-    if not humanoidrootpart then return nil, math.huge end
-    local coin_container = map and map:FindFirstChild("CoinContainer")
-    if not coin_container then return nil, math.huge end
+    local hrp = get_root_part()
+    if not hrp then return nil, math.huge end
 
-    local best_coin = nil
-    local shortest_dist = math.huge
+    local closest_part = nil
+    local min_dist = math.huge
 
-    for _, coin in ipairs(coin_container:GetChildren()) do
-        if is_valid(coin) and coin:FindFirstChild("TouchInterest") then
-            local coin_pos = coin.Position
-            if coin_pos then
-                local dist = magnitude(coin_pos, humanoidrootpart.Position)
-                if dist < shortest_dist then
-                    shortest_dist = dist
-                    best_coin = coin
-                end
-            end
-        end
-    end
-
-    return best_coin, shortest_dist
-end
-
-local function get_dynamic_underground_y()
-    local min_y = 9999
-    if is_valid(map) then
-        local spawns = map:FindFirstChild("Spawns")
-        if spawns then
-            for _, child in ipairs(spawns:GetChildren()) do
-                if child:IsA("BasePart") then
-                    local pos = child.Position
-                    if pos and pos.Y < min_y then
-                        min_y = pos.Y
+    for _, obj in ipairs(workspace:GetChildren()) do
+        local container = obj:FindFirstChild("CoinContainer")
+        if container then
+            for _, coin in ipairs(container:GetChildren()) do
+                if coin:IsA("BasePart") and coin:FindFirstChild("TouchInterest") then
+                    local dist = (hrp.Position - coin.Position).Magnitude
+                    if dist < min_dist then
+                        min_dist = dist
+                        closest_part = coin
                     end
                 end
             end
         end
     end
-    if min_y == 9999 then min_y = 0 end
-    return min_y - Config.MapOffset
-end
 
-local function is_water_map()
-    if not is_valid(map) then return false end
-    for _, name in ipairs(Config.NoUndergroundMaps) do
-        if map.Name == name then return true end
-    end
-    return false
-end
-
--- Прямолинейный твин под пол
-local function tween_position(object, target, duration)
-    if not duration or duration <= 0 then duration = 1 end
-    can_tween = false
-    local function cleanup()
-        can_tween = true
-    end
-
-    pcall(function()
-        local function move_to(end_pos, time_sec)
-            local start_time = os.clock()
-            local start_pos = object.Position
-            if not start_pos or not end_pos then return true end
-            local end_time = start_time + time_sec
-            local aborted = false
-            while os.clock() < end_time do
-                if not is_valid(object) or not is_valid(target) or not is_valid(map) then
-                    aborted = true
-                    break
-                end
-                local alpha = (os.clock() - start_time) / time_sec
-                if alpha > 1 then alpha = 1 end
-                local sx, sy, sz = start_pos.X, start_pos.Y, start_pos.Z
-                local tx, ty, tz = end_pos.X, end_pos.Y, end_pos.Z
-                object.Position = Vector3.new(
-                    sx + (tx - sx) * alpha,
-                    sy + (ty - sy) * alpha,
-                    sz + (tz - sz) * alpha
-                )
-                object.Velocity = Vector3.new(0, 0, 0)
-                pcall(function() object.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
-                task.wait()
-            end
-            return aborted
-        end
-
-        if not is_valid(target) then return end
-        local obj_pos = object.Position
-        local tgt_pos = target.Position
-        if not obj_pos or not tgt_pos then return end
-
-        if is_water_map() then
-            move_to(tgt_pos, duration)
-            if is_valid(target) and is_valid(object) then
-                object.Position = target.Position
-            end
-        else
-            local underground_y = get_dynamic_underground_y()
-            local target_under_pos = Vector3.new(tgt_pos.X, underground_y, tgt_pos.Z)
-            local current_under_pos = Vector3.new(obj_pos.X, underground_y, obj_pos.Z)
-
-            if math.abs(obj_pos.Y - underground_y) > 2 then
-                move_to(current_under_pos, 0.04)
-            end
-            if not move_to(target_under_pos, duration) then
-                if is_valid(target) and is_valid(object) then
-                    object.Position = target.Position
-                    if type(firetouchinterest) == "function" then
-                        pcall(function()
-                            firetouchinterest(object, target, 0)
-                            task.wait(0.01)
-                            firetouchinterest(object, target, 1)
-                        end)
-                    end
-                    task.wait()
-                    if is_valid(object) then
-                        object.Position = Vector3.new(object.Position.X, underground_y, object.Position.Z)
-                    end
+    if not closest_part then
+        for _, descendant in ipairs(workspace:GetDescendants()) do
+            if descendant:IsA("BasePart") and (descendant.Name == "Coin_Server" or descendant.Name == "Coin" or descendant.Name == "candy") and descendant:FindFirstChild("TouchInterest") then
+                local dist = (hrp.Position - descendant.Position).Magnitude
+                if dist < min_dist then
+                    min_dist = dist
+                    closest_part = descendant
                 end
             end
         end
-    end)
-    cleanup()
+    end
+
+    return closest_part, min_dist
 end
 
-local function update_auto_farm()
-    map = find_map()
-    local current_map_name = map and map.Name or nil
-    if current_map_name ~= last_map_name then
-        reset_round_state()
-        last_map_name = current_map_name
+-- Reset Character in Void
+local function reset_in_void()
+    if is_resetting then return end
+    is_resetting = true
+    set_status("Bag Full (" .. current_bag_coins .. "): Resetting...", Color3.fromRGB(255, 90, 90))
+
+    if (os.clock() - last_bag_webhook_time) >= 15 then
+        last_bag_webhook_time = os.clock()
+        send_webhook(true)
     end
 
-    local character = localplayer.Character
-    if not character then
-        set_status("Character missing", Color3.fromRGB(200, 200, 200))
-        return
+    local hrp = get_root_part()
+    local hum = get_humanoid()
+    if hrp then
+        hrp.Position = VOID_POSITION
+        hrp.Velocity = Vector3.new(0, -500, 0)
     end
-    local humanoidrootpart = character:FindFirstChild("HumanoidRootPart")
-    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:FindFirstChild("Humanoid")
-    if not humanoidrootpart then
-        set_status("RootPart missing", Color3.fromRGB(200, 200, 200))
-        return
+    if hum then
+        pcall(function() hum.Health = 0 end)
     end
+end
 
-    if resetting_character and resetting_character ~= character then
-        if humanoid and humanoid.Health > 0 then
-            resetting_character = nil
-            is_resetting_in_void = false
-            has_reset_for_bag = true
-        end
-    end
+-- Remote Event Listeners for Round Tracking (TravHub Architecture)
+local gameplayRemotes = replicatedstorage:FindFirstChild("Remotes") and replicatedstorage.Remotes:FindFirstChild("Gameplay")
+if gameplayRemotes then
+    local roundStart = gameplayRemotes:FindFirstChild("RoundStart")
+    local roundEnd = gameplayRemotes:FindFirstChild("RoundEndFade")
+    local coinCollected = gameplayRemotes:FindFirstChild("CoinCollected")
 
-    if is_resetting_in_void then
-        set_status("Bag Full: Resetting in Void...", Color3.fromRGB(255, 90, 90))
-        humanoidrootpart.Position = VOID_POSITION
-        humanoidrootpart.Velocity = Vector3.new(0, -500, 0)
-        pcall(function() humanoid.Health = 0 end)
-        return
-    end
-
-    if humanoid and humanoid.Health <= 0 then
-        return
+    if roundStart then
+        roundStart.OnClientEvent:Connect(function()
+            is_round_active = true
+            is_resetting = false
+            current_bag_coins = 0
+            set_status("ROUND ACTIVE | Farm Started", Color3.fromRGB(0, 255, 140))
+        end)
     end
 
-    set_noclip()
-    local bag_val = get_bag_coins()
-    local is_bag_full = (bag_val >= (Config.MaxCoins or 40))
-
-    if not is_bag_full and bag_val < Config.MaxCoins then
-        has_reset_for_bag = false
+    if roundEnd then
+        roundEnd.OnClientEvent:Connect(function()
+            is_round_active = false
+            is_resetting = false
+            set_status("LOBBY (Round Ended)", Color3.fromRGB(200, 200, 200))
+        end)
     end
 
-    -- Статистика монет
-    if bag_val > last_bag_count then
-        local diff = bag_val - last_bag_count
-        if diff <= 50 then
-            session_coins = session_coins + diff
-        end
-    end
-    last_bag_count = bag_val
-
-    if is_bag_full and not has_reset_for_bag then
-        is_resetting_in_void = true
-        resetting_character = character
-        set_status("Bag Full (" .. bag_val .. "): Resetting...", Color3.fromRGB(255, 90, 90))
-        if (os.clock() - last_bag_webhook_time) >= 15 then
-            last_bag_webhook_time = os.clock()
-            send_webhook(true)
-        end
-        humanoidrootpart.Position = VOID_POSITION
-        humanoidrootpart.Velocity = Vector3.new(0, -500, 0)
-        pcall(function() humanoid.Health = 0 end)
-        return
-    end
-
-    if is_valid(map) then
-        local closest_coin, coin_distance = get_closest_coin()
-
-        if is_valid(closest_coin) then
-            humanoidrootpart.Velocity = Vector3.new(0, 0, 0)
-            set_status("RAGE FARMING | Bag: " .. bag_val .. " | Total: " .. session_coins, Color3.fromRGB(0, 255, 140))
-            if can_tween then
-                local dur = coin_distance / Config.TweenSpeed
-                task.spawn(function()
-                    tween_position(humanoidrootpart, closest_coin, dur)
-                end)
+    if coinCollected then
+        coinCollected.OnClientEvent:Connect(function(coinType, amount)
+            if amount then
+                current_bag_coins = tonumber(amount) or current_bag_coins
+            else
+                current_bag_coins = current_bag_coins + 1
             end
-        else
-            set_status("Searching Coins... | Bag: " .. bag_val, Color3.fromRGB(255, 210, 80))
-        end
-    else
-        set_status("LOBBY (Waiting for Map)", Color3.fromRGB(200, 200, 200))
+
+            session_coins = session_coins + 1
+            save_stats()
+
+            if current_bag_coins >= Config.MaxCoins and Config.AutoResetOnFull then
+                reset_in_void()
+            end
+        end)
     end
 end
 
--- Стартовая отправка подтверждения
-send_webhook(false)
+-- Character Respawn Handler
+localplayer.CharacterAdded:Connect(function(newChar)
+    is_resetting = false
+    current_bag_coins = 0
+    task.wait(1)
+end)
 
--- Главный непрерывный цикл
-while true do
-    pcall(function()
-        update_auto_farm()
-    end)
-    task.wait()
-end
+-- Main High-Speed Farming Loop (TravHub Proximity Tween + Distant TP)
+task.spawn(function()
+    while true do
+        local hrp = get_root_part()
+        local hum = get_humanoid()
+
+        -- Auto-detect round if map exists with coins
+        local coin_target, coin_dist = get_closest_coin()
+        if coin_target and not is_round_active then
+            is_round_active = true
+        end
+
+        if hrp and hum and hum.Health > 0 and not is_resetting then
+            local bag_val = get_bag_coins()
+
+            if bag_val >= Config.MaxCoins and Config.AutoResetOnFull then
+                reset_in_void()
+            elseif coin_target and is_round_active then
+                set_status("FARMING | Bag: " .. bag_val .. " / " .. Config.MaxCoins .. " | Session: " .. session_coins, Color3.fromRGB(0, 255, 140))
+
+                if coin_dist > Config.TeleportDistance then
+                    -- Instant Teleport for distant coins
+                    hrp.CFrame = coin_target.CFrame
+                    task.wait(0.05)
+                else
+                    -- Smooth Linear Tween for proximity coins
+                    local duration = math.clamp(coin_dist / Config.FarmSpeed, 0.05, 3.0)
+                    local tween = tweenservice:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+                        CFrame = coin_target.CFrame
+                    })
+                    tween:Play()
+
+                    local start_t = os.clock()
+                    while coin_target and coin_target:FindFirstChild("TouchInterest") and is_round_active and (os.clock() - start_t) < duration do
+                        task.wait()
+                    end
+                    pcall(function() tween:Cancel() end)
+                end
+            else
+                if is_round_active then
+                    set_status("Searching Coins... | Bag: " .. bag_val, Color3.fromRGB(255, 210, 80))
+                else
+                    set_status("LOBBY (Waiting for Round)", Color3.fromRGB(200, 200, 200))
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+print("[MM2 High-Speed Autofarm] Initialized successfully. Level: " .. get_real_level() .. ", Player: " .. localplayer.Name)

@@ -14,7 +14,7 @@
 local Config = {
     WebhookURL = "https://discord.com/api/webhooks/1537506182548295760/lOkkQ7G6mYbL--4LcsiTbYPeuN7oVeJ2c9GS5Wmn54bO-vCjzLaDFDPwEIhOwVRvvenZ",
     WebhookInterval = 60, -- Интервал отчета в секундах
-    FarmSpeed = 25,       -- Скорость перемещения к монетам (25 studs/sec)
+    FarmSpeed = 21,       -- Скорость перемещения к монетам (25 studs/sec)
     MaxCoins = 40,        -- Лимит монет до сброса в войд
     TeleportDistance = 140, -- Дистанция для мгновенного ТП к дальним монетам
     AutoResetOnFull = true,
